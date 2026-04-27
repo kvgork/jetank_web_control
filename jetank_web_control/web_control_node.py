@@ -10,10 +10,16 @@ Endpoints:
   GET  /            - control page (HTML)
   GET  /stream.mjpg - MJPEG camera stream
   WS   /ws          - JSON command channel  {"linear_x": float, "angular_z": float}
+  GET  /map.png     - current Nav2 occupancy map as PNG (404 when no map yet)
+  GET  /map_meta    - map metadata JSON  {"width", "height", "resolution"}
+  POST /save_map    - save map via map_saver_cli to ~/maps/jetank_map_<ts>
 """
 
 import asyncio
+import io
 import json
+import os
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -21,7 +27,15 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage
+
+try:
+    import numpy as np
+    from PIL import Image as _PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 
 try:
     from aiohttp import web
@@ -134,6 +148,36 @@ _HTML = """<!DOCTYPE html>
                                flex:0 0 200px;padding:8px}
     #joystick{width:130px;height:130px}
   }
+
+  /* ---- mapping panel (desktop only) --------------------------------- */
+  .map-panel{display:none;width:320px;background:#010409;
+             border-left:1px solid #30363d;flex-direction:column;
+             overflow:hidden;flex-shrink:0}
+  .map-header{padding:10px 12px;background:#161b22;border-bottom:1px solid #30363d;
+              display:flex;flex-direction:column;gap:4px;flex-shrink:0}
+  .map-title{font-size:.72rem;text-transform:uppercase;letter-spacing:1px;color:#58a6ff}
+  .map-meta-txt{font-size:.65rem;color:#8b949e}
+  .map-canvas-wrap{flex:1;overflow:hidden;display:flex;align-items:center;
+                   justify-content:center;padding:4px}
+  #map-img{image-rendering:pixelated;max-width:100%;max-height:100%;
+           object-fit:contain;display:block;opacity:.3}
+  #map-img.loaded{opacity:1}
+  .map-footer{padding:8px 12px;background:#161b22;border-top:1px solid #30363d;
+              display:flex;gap:8px;align-items:center;flex-shrink:0}
+  .mbtn{padding:5px 12px;border-radius:5px;border:1px solid #30363d;
+        background:#21262d;color:#c9d1d9;font-size:.72rem;cursor:pointer;
+        font-family:monospace;transition:background .1s;white-space:nowrap}
+  .mbtn:hover{background:#30363d}.mbtn:active{background:#58a6ff22}
+  .mbtn:disabled{opacity:.5;cursor:default}
+  .map-save-sts{font-size:.65rem;flex:1}
+  /* mapping toggle at bottom of sidebar */
+  .sidebar-footer{margin-top:auto;padding-top:10px;border-top:1px solid #30363d}
+  /* never show map panel on touch */
+  body.is-touch .map-panel{display:none!important}
+  body.is-touch .sidebar-footer{display:none}
+  /* mapping-mode toggle button states */
+  .mbtn-on{background:#238636;border-color:#2ea043;color:#fff}
+  .mbtn-on:hover{background:#2ea043}
 </style>
 </head>
 <body>
@@ -150,6 +194,23 @@ _HTML = """<!DOCTYPE html>
     <img id="cam-img" src="/stream.mjpg" alt="camera"
          onerror="scheduleReconnectStream()" onload="onImgLoad()">
     <div class="cam-overlay">left camera</div>
+  </div>
+
+  <!-- mapping panel: desktop only, shown when mapping mode is active -->
+  <div class="map-panel" id="map-panel">
+    <div class="map-header">
+      <span class="map-title">&#x1F5FA; Live Map</span>
+      <span class="map-meta-txt" id="map-meta-txt">Waiting for /map topic&#x2026;</span>
+    </div>
+    <div class="map-canvas-wrap">
+      <img id="map-img" src="" alt=""
+           onload="this.classList.add('loaded')"
+           onerror="this.classList.remove('loaded');document.getElementById('map-meta-txt').textContent='Waiting for /map topic&#x2026;'">
+    </div>
+    <div class="map-footer">
+      <button class="mbtn" id="save-map-btn" onclick="saveMap()">Save Map</button>
+      <span class="map-save-sts" id="map-save-sts"></span>
+    </div>
   </div>
 
   <!-- desktop sidebar -->
@@ -193,6 +254,12 @@ _HTML = """<!DOCTYPE html>
     <div class="section">
       <div class="stitle">Gamepad</div>
       <div class="gp-row" id="gp-status-d">Not detected</div>
+    </div>
+    <div class="section sidebar-footer">
+      <div class="stitle">Navigation</div>
+      <button class="mbtn" id="map-toggle-btn" onclick="toggleMappingMode()">
+        &#x1F5FA; Mapping Mode
+      </button>
     </div>
   </div>
 
@@ -465,6 +532,76 @@ function scheduleReconnectStream() {
 }
 
 // ===========================================================================
+// Mapping Mode (desktop only)
+// ===========================================================================
+let mappingMode = false;
+let mapRefreshTimer = null;
+
+function toggleMappingMode() {
+  if (isTouch) return;
+  mappingMode = !mappingMode;
+  const panel = document.getElementById('map-panel');
+  const btn   = document.getElementById('map-toggle-btn');
+  if (mappingMode) {
+    panel.style.display = 'flex';
+    btn.classList.add('mbtn-on');
+    btn.innerHTML = '&#x1F5FA; Stop Mapping';
+    startMapRefresh();
+  } else {
+    panel.style.display = 'none';
+    btn.classList.remove('mbtn-on');
+    btn.innerHTML = '&#x1F5FA; Mapping Mode';
+    stopMapRefresh();
+  }
+}
+
+function startMapRefresh() {
+  refreshMap();
+  mapRefreshTimer = setInterval(refreshMap, 1500);
+}
+
+function stopMapRefresh() {
+  clearInterval(mapRefreshTimer);
+  mapRefreshTimer = null;
+}
+
+function refreshMap() {
+  fetch('/map_meta')
+    .then(r => r.ok ? r.json() : null)
+    .then(meta => {
+      if (!meta || !meta.width) return;
+      const w = (meta.width  * meta.resolution).toFixed(1);
+      const h = (meta.height * meta.resolution).toFixed(1);
+      document.getElementById('map-meta-txt').textContent =
+        meta.width + '\\u00D7' + meta.height + 'px \\u00B7 ' +
+        w + '\\u00D7' + h + 'm \\u00B7 ' + meta.resolution + 'm/px';
+    })
+    .catch(() => {});
+  document.getElementById('map-img').src = '/map.png?t=' + Date.now();
+}
+
+function saveMap() {
+  const btn = document.getElementById('save-map-btn');
+  const sts = document.getElementById('map-save-sts');
+  btn.disabled = true;
+  btn.textContent = 'Saving\\u2026';
+  sts.textContent = '';
+  fetch('/save_map', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.status === 'ok') {
+        sts.style.color = '#3fb950';
+        sts.textContent = '\\u2713 ' + d.path;
+      } else {
+        sts.style.color = '#f85149';
+        sts.textContent = d.msg || 'Error';
+      }
+    })
+    .catch(() => { sts.style.color = '#f85149'; sts.textContent = 'Request failed'; })
+    .finally(() => { btn.disabled = false; btn.textContent = 'Save Map'; });
+}
+
+// ===========================================================================
 // Boot
 // ===========================================================================
 connect();
@@ -502,8 +639,13 @@ class WebControlNode(Node):
         self._cmd_lock = threading.Lock()
         self._last_cmd_time = 0.0
 
+        self._map_lock = threading.Lock()
+        self._latest_map_png: Optional[bytes] = None
+        self._map_meta: dict = {}
+
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
         self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
+        self.create_subscription(OccupancyGrid, '/map', self._on_map, 1)
 
         # Watchdog: stop robot if commands stop arriving
         self.create_timer(0.1, self._watchdog_cb)
@@ -519,6 +661,27 @@ class WebControlNode(Node):
         with self._frame_lock:
             self._latest_jpeg = bytes(msg.data)
 
+    def _on_map(self, msg: OccupancyGrid):
+        if not _PIL_AVAILABLE:
+            return
+        w, h = msg.info.width, msg.info.height
+        if w == 0 or h == 0:
+            return
+        data = np.frombuffer(bytes(msg.data), dtype=np.int8).reshape((h, w))
+        rgb = np.full((h, w, 3), 128, dtype=np.uint8)   # unknown = mid-gray
+        rgb[data == 0] = [220, 220, 220]                 # free = light
+        rgb[data > 0]  = [20,  20,  20]                  # occupied = dark
+        img = _PILImage.fromarray(np.flipud(rgb), 'RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG', optimize=True)
+        with self._map_lock:
+            self._latest_map_png = buf.getvalue()
+            self._map_meta = {
+                'resolution': round(float(msg.info.resolution), 4),
+                'width': w,
+                'height': h,
+            }
+
     def _watchdog_cb(self):
         with self._cmd_lock:
             age = time.monotonic() - self._last_cmd_time
@@ -530,6 +693,14 @@ class WebControlNode(Node):
     def get_frame(self) -> Optional[bytes]:
         with self._frame_lock:
             return self._latest_jpeg
+
+    def get_map_png(self) -> Optional[bytes]:
+        with self._map_lock:
+            return self._latest_map_png
+
+    def get_map_meta(self) -> dict:
+        with self._map_lock:
+            return dict(self._map_meta)
 
     def apply_cmd(self, linear_x: float, angular_z: float):
         lx = max(-1.0, min(1.0, linear_x))  * self._max_linear
@@ -611,6 +782,42 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def handle_map_png(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    data = node.get_map_png()
+    if data is None:
+        return web.Response(status=404)
+    return web.Response(body=data, content_type='image/png',
+                        headers={'Cache-Control': 'no-cache, no-store'})
+
+
+async def handle_map_meta(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.get_map_meta())
+
+
+async def handle_save_map(request: web.Request) -> web.Response:
+    ts = time.strftime('%Y%m%d_%H%M%S')
+    map_dir = os.path.expanduser('~/maps')
+    os.makedirs(map_dir, exist_ok=True)
+    map_path = os.path.join(map_dir, f'jetank_map_{ts}')
+    try:
+        result = subprocess.run(
+            ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', map_path],
+            capture_output=True, text=True, timeout=15, env=os.environ,
+        )
+        if result.returncode == 0:
+            return web.json_response({'status': 'ok', 'path': map_path})
+        return web.json_response(
+            {'status': 'error', 'msg': result.stderr.strip() or result.stdout.strip()},
+            status=500,
+        )
+    except subprocess.TimeoutExpired:
+        return web.json_response({'status': 'error', 'msg': 'map_saver_cli timed out'}, status=500)
+    except FileNotFoundError:
+        return web.json_response({'status': 'error', 'msg': 'ros2 command not found'}, status=500)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -621,6 +828,9 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/', handle_index)
     app.router.add_get('/stream.mjpg', handle_mjpeg)
     app.router.add_get('/ws', handle_websocket)
+    app.router.add_get('/map.png', handle_map_png)
+    app.router.add_get('/map_meta', handle_map_meta)
+    app.router.add_post('/save_map', handle_save_map)
     return app
 
 
