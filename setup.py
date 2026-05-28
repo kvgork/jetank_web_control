@@ -16,7 +16,7 @@ setup(
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='koen',
-    maintainer_email='kvgorkom@smart-robotics.nl',
+    maintainer_email='gorkom.projects@gmail.com',
     description='Web-based remote control interface for the JeTank robot',
     license='MIT',
     tests_require=['pytest'],

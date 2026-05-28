@@ -4,7 +4,7 @@
   <name>jetank_web_control</name>
   <version>0.0.1</version>
   <description>Web-based remote control interface for the JeTank robot</description>
-  <maintainer email="kvgorkom@smart-robotics.nl">koen</maintainer>
+  <maintainer email="gorkom.projects@gmail.com">koen</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
