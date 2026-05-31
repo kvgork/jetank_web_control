@@ -18,7 +18,9 @@ Endpoints:
 import asyncio
 import io
 import json
+import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -26,9 +28,11 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from rclpy.action import ActionClient
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image
+from nav2_msgs.action import NavigateToPose
 
 try:
     import numpy as np
@@ -150,18 +154,26 @@ _HTML = """<!DOCTYPE html>
   }
 
   /* ---- mapping panel (desktop only) --------------------------------- */
-  .map-panel{display:none;width:320px;background:#010409;
-             border-left:1px solid #30363d;flex-direction:column;
-             overflow:hidden;flex-shrink:0}
+  .cam-col{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+  .map-panel{display:flex;background:#010409;
+             border-top:1px solid #30363d;flex-direction:column;
+             overflow:hidden;flex:0 0 44%;max-height:44%}
   .map-header{padding:10px 12px;background:#161b22;border-bottom:1px solid #30363d;
               display:flex;flex-direction:column;gap:4px;flex-shrink:0}
   .map-title{font-size:.72rem;text-transform:uppercase;letter-spacing:1px;color:#58a6ff}
   .map-meta-txt{font-size:.65rem;color:#8b949e}
-  .map-canvas-wrap{flex:1;overflow:hidden;display:flex;align-items:center;
-                   justify-content:center;padding:4px}
-  #map-img{image-rendering:pixelated;max-width:100%;max-height:100%;
+  .map-canvas-wrap{position:relative;flex:1;overflow:hidden;display:flex;
+                   align-items:center;justify-content:center;padding:4px}
+  #map-img{image-rendering:pixelated;width:100%;height:100%;
            object-fit:contain;display:block;opacity:.3}
   #map-img.loaded{opacity:1}
+  #map-overlay{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
+  #map-loading{position:absolute;inset:0;display:none;flex-direction:column;
+               gap:10px;align-items:center;justify-content:center;
+               background:rgba(1,4,9,.66);color:#e6edf3;font-size:.78rem}
+  .spinner{width:34px;height:34px;border:3px solid #30363d;border-top-color:#58a6ff;
+           border-radius:50%;animation:spin 0.9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
   .map-footer{padding:8px 12px;background:#161b22;border-top:1px solid #30363d;
               display:flex;gap:8px;align-items:center;flex-shrink:0}
   .mbtn{padding:5px 12px;border-radius:5px;border:1px solid #30363d;
@@ -189,6 +201,8 @@ _HTML = """<!DOCTYPE html>
 </header>
 
 <main>
+  <!-- left column: camera on top, live map underneath -->
+  <div class="cam-col">
   <!-- camera -->
   <div class="cam">
     <img id="cam-img" src="/stream.mjpg" alt="camera"
@@ -203,15 +217,26 @@ _HTML = """<!DOCTYPE html>
       <span class="map-meta-txt" id="map-meta-txt">Waiting for /map topic&#x2026;</span>
     </div>
     <div class="map-canvas-wrap">
-      <img id="map-img" src="" alt=""
+      <img id="map-img" src="" alt="" style="cursor:crosshair"
+           onclick="mapClick(event)"
            onload="this.classList.add('loaded')"
            onerror="this.classList.remove('loaded');document.getElementById('map-meta-txt').textContent='Waiting for /map topic&#x2026;'">
+      <canvas id="map-overlay"></canvas>
+      <div id="map-loading">
+        <div class="spinner"></div>
+        <div id="map-loading-txt">Determining robot position&#x2026;</div>
+      </div>
     </div>
     <div class="map-footer">
+      <button class="mbtn" id="start-map-btn" onclick="startMapping()">Start Mapping</button>
+      <button class="mbtn" id="start-nav-btn" onclick="startNavigation()" disabled>Navigate (saved map)</button>
       <button class="mbtn" id="save-map-btn" onclick="saveMap()">Save Map</button>
+      <button class="mbtn" id="stop-nav-btn" onclick="stopNav()">Stop</button>
       <span class="map-save-sts" id="map-save-sts"></span>
+      <div class="map-hint" id="nav-hint">Start mapping (or load a saved map), then click the map to send the robot there.</div>
     </div>
   </div>
+  </div><!-- /cam-col -->
 
   <!-- desktop sidebar -->
   <div class="sidebar">
@@ -537,27 +562,91 @@ function scheduleReconnectStream() {
 let mappingMode = false;
 let mapRefreshTimer = null;
 
+// The map panel is always visible under the camera. The sidebar button now
+// just starts/stops the SLAM+Nav2 stack (the map itself refreshes on its own).
 function toggleMappingMode() {
   if (isTouch) return;
   mappingMode = !mappingMode;
-  const panel = document.getElementById('map-panel');
-  const btn   = document.getElementById('map-toggle-btn');
+  const btn = document.getElementById('map-toggle-btn');
   if (mappingMode) {
-    panel.style.display = 'flex';
     btn.classList.add('mbtn-on');
-    btn.innerHTML = '&#x1F5FA; Stop Mapping';
-    startMapRefresh();
+    btn.innerHTML = '&#x1F5FA; Stop Nav';
+    startMapping();
   } else {
-    panel.style.display = 'none';
     btn.classList.remove('mbtn-on');
-    btn.innerHTML = '&#x1F5FA; Mapping Mode';
-    stopMapRefresh();
+    btn.innerHTML = '&#x1F5FA; Start Mapping';
+    stopNav();
   }
 }
 
+let lastMeta = null;
+let localizing = false;
+let localizeStart = 0;
+
 function startMapRefresh() {
   refreshMap();
-  mapRefreshTimer = setInterval(refreshMap, 1500);
+  refreshNavStatus();
+  refreshRobotPose();
+  mapRefreshTimer = setInterval(() => {
+    refreshMap(); refreshNavStatus(); refreshRobotPose();
+  }, 1000);
+}
+
+function refreshRobotPose() {
+  fetch('/robot_pose')
+    .then(r => r.ok ? r.json() : null)
+    .then(p => {
+      const load = document.getElementById('map-loading');
+      if (!p || !p.available) {
+        if (localizing) load.style.display = 'flex';  // still determining
+        return;
+      }
+      drawRobotArrow(p);
+      if (localizing) {
+        if (p.converged) {
+          localizing = false;
+          load.style.display = 'none';
+          navMsg('\\u2713 localized (' + p.x + ', ' + p.y + ')', true);
+        } else if (Date.now() - localizeStart > 25000) {
+          localizing = false;
+          load.style.display = 'none';
+          navMsg('localization uncertain \\u2014 drive a little or re-try', false);
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+function drawRobotArrow(p) {
+  const img = document.getElementById('map-img');
+  const cv = document.getElementById('map-overlay');
+  if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return;
+  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
+  if (!cv.width || !cv.height) return;
+  const er = img.getBoundingClientRect();   // img ELEMENT box (fills the wrap)
+  const cr = cv.getBoundingClientRect();
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  // The image is letterboxed inside the element by object-fit:contain — compute
+  // the actual rendered image rect, not the element box.
+  const scale = Math.min(er.width / natW, er.height / natH);
+  const cw = natW * scale, ch = natH * scale;
+  const contentLeft = er.left + (er.width - cw) / 2;
+  const contentTop = er.top + (er.height - ch) / 2;
+  const col = (p.x - lastMeta.origin_x) / lastMeta.resolution;
+  const gridRow = (p.y - lastMeta.origin_y) / lastMeta.resolution;
+  const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is vertically flipped
+  const px = (contentLeft - cr.left) + ix * scale;
+  const py = (contentTop - cr.top) + iy * scale;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(-p.yaw);                  // image y is down => screen angle = -yaw
+  ctx.fillStyle = '#ff3b30'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(16, 0); ctx.lineTo(-10, -9); ctx.lineTo(-4, 0); ctx.lineTo(-10, 9);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
 }
 
 function stopMapRefresh() {
@@ -570,6 +659,7 @@ function refreshMap() {
     .then(r => r.ok ? r.json() : null)
     .then(meta => {
       if (!meta || !meta.width) return;
+      lastMeta = meta;
       const w = (meta.width  * meta.resolution).toFixed(1);
       const h = (meta.height * meta.resolution).toFixed(1);
       document.getElementById('map-meta-txt').textContent =
@@ -601,10 +691,90 @@ function saveMap() {
     .finally(() => { btn.disabled = false; btn.textContent = 'Save Map'; });
 }
 
+function navMsg(text, ok) {
+  const sts = document.getElementById('map-save-sts');
+  sts.style.color = ok ? '#3fb950' : '#f85149';
+  sts.textContent = text;
+}
+
+function refreshNavStatus() {
+  fetch('/nav_status')
+    .then(r => r.ok ? r.json() : null)
+    .then(s => {
+      if (!s) return;
+      document.getElementById('start-nav-btn').disabled = !s.has_map;
+      const hint = document.getElementById('nav-hint');
+      if (s.running === 'mapping')      hint.textContent = 'Mapping active \\u00B7 drive to build the map, then click it to navigate.';
+      else if (s.running === 'navigation') hint.textContent = 'Navigation active (saved map) \\u00B7 click the map to send the robot.';
+      else hint.textContent = s.has_map ? 'Saved map available \\u00B7 Start Mapping or Navigate (saved map).'
+                                        : 'Start Mapping, drive around, then Save Map.';
+    })
+    .catch(() => {});
+}
+
+function startMapping() {
+  navMsg('Starting mapping\\u2026', true);
+  fetch('/start_mapping', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => navMsg(d.status === 'ok' ? '\\u2713 mapping started' : (d.msg || 'error'), d.status === 'ok'))
+    .catch(() => navMsg('Request failed', false))
+    .finally(refreshNavStatus);
+}
+
+function startNavigation() {
+  navMsg('Starting navigation\\u2026', true);
+  fetch('/start_navigation', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      navMsg(d.status === 'ok' ? 'determining position\\u2026' : (d.msg || 'error'),
+             d.status === 'ok');
+      if (d.status === 'ok') {
+        // Show the "determining robot position" loader until AMCL converges
+        // (refreshRobotPose hides it and draws the pose arrow).
+        localizing = true;
+        localizeStart = Date.now();
+        document.getElementById('map-loading-txt').textContent =
+          'Determining robot position\\u2026';
+        document.getElementById('map-loading').style.display = 'flex';
+      }
+    })
+    .catch(() => navMsg('Request failed', false))
+    .finally(refreshNavStatus);
+}
+
+function stopNav() {
+  fetch('/stop_nav', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => navMsg('Stopped ' + (d.stopped || 'nav'), true))
+    .catch(() => navMsg('Request failed', false))
+    .finally(refreshNavStatus);
+}
+
+function mapClick(ev) {
+  const img = document.getElementById('map-img');
+  if (!img.naturalWidth) return;
+  const r = img.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) / r.width  * img.naturalWidth);
+  const y = Math.round((ev.clientY - r.top)  / r.height * img.naturalHeight);
+  navMsg('Sending goal\\u2026', true);
+  fetch('/navigate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({x: x, y: y}),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.status === 'ok') navMsg('\\u2713 goal (' + d.goal.x + ', ' + d.goal.y + ') m', true);
+      else navMsg(d.msg || 'goal rejected', false);
+    })
+    .catch(() => navMsg('Request failed', false));
+}
+
 // ===========================================================================
 // Boot
 // ===========================================================================
 connect();
+if (!isTouch) startMapRefresh();   // map panel is always shown under the camera
 </script>
 </body>
 </html>
@@ -625,6 +795,20 @@ class WebControlNode(Node):
         self.declare_parameter('max_linear_speed', 0.5)
         self.declare_parameter('max_angular_speed', 1.0)
         self.declare_parameter('cmd_timeout_sec', 0.5)
+        # When false, subscribe to a raw sensor_msgs/Image and JPEG-encode it
+        # locally (used in simulation, where Gazebo publishes raw Image and the
+        # compressed_image_transport plugin is not available).
+        self.declare_parameter('image_compressed', True)
+        # Simulation mode: nav launches use the sim clock and maps live under a
+        # canonical name so a previously-made sim map can be reused.
+        self.declare_parameter('sim', False)
+        self.declare_parameter('map_dir', os.path.expanduser('~/maps'))
+        self.declare_parameter('sim_map_name', 'sim_map')
+        # Robot spawn pose in the map frame, used to seed AMCL when navigating on
+        # a saved map (otherwise AMCL never publishes map->odom and nav is dead).
+        self.declare_parameter('initial_pose_x', 0.0)
+        self.declare_parameter('initial_pose_y', 0.0)
+        self.declare_parameter('initial_pose_yaw', 0.0)
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -632,6 +816,10 @@ class WebControlNode(Node):
         self._max_linear = self.get_parameter('max_linear_speed').value
         self._max_angular = self.get_parameter('max_angular_speed').value
         self._cmd_timeout = self.get_parameter('cmd_timeout_sec').value
+        image_compressed = self.get_parameter('image_compressed').value
+        self._sim = bool(self.get_parameter('sim').value)
+        self._map_dir = os.path.expanduser(self.get_parameter('map_dir').value)
+        self._sim_map_name = self.get_parameter('sim_map_name').value
 
         self._frame_lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
@@ -642,9 +830,25 @@ class WebControlNode(Node):
         self._map_lock = threading.Lock()
         self._latest_map_png: Optional[bytes] = None
         self._map_meta: dict = {}
+        self._map_origin = (0.0, 0.0)   # (x, y) of map cell (0,0) in the map frame
+
+        # Navigation stack lifecycle (a launched ros2 process) + goal action client.
+        self._nav_lock = threading.Lock()
+        self._nav_proc: Optional[subprocess.Popen] = None
+        self._nav_mode: Optional[str] = None   # 'mapping' | 'navigation' | None
+        self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        self._initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        # AMCL's estimated robot pose (for the web map arrow + localization status).
+        self._amcl_lock = threading.Lock()
+        self._amcl_pose = None
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose',
+                                 self._on_amcl_pose, 10)
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
-        self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
+        if image_compressed:
+            self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
+        else:
+            self.create_subscription(Image, image_topic, self._on_raw_image, 10)
         self.create_subscription(OccupancyGrid, '/map', self._on_map, 1)
 
         # Watchdog: stop robot if commands stop arriving
@@ -661,6 +865,33 @@ class WebControlNode(Node):
         with self._frame_lock:
             self._latest_jpeg = bytes(msg.data)
 
+    def _on_raw_image(self, msg: Image):
+        # Encode a raw sensor_msgs/Image to JPEG (simulation path). Supports the
+        # common rgb8/bgr8 encodings; falls back to mono treatment otherwise.
+        if not _PIL_AVAILABLE:
+            return
+        h, w = msg.height, msg.width
+        if h == 0 or w == 0:
+            return
+        arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        enc = msg.encoding.lower()
+        try:
+            if enc in ('rgb8', 'bgr8'):
+                arr = arr.reshape((h, w, 3))
+                if enc == 'bgr8':
+                    arr = arr[:, :, ::-1]
+                img = _PILImage.fromarray(arr, 'RGB')
+            elif enc in ('mono8', '8uc1'):
+                img = _PILImage.fromarray(arr.reshape((h, w)), 'L')
+            else:  # best-effort: assume 3-channel
+                img = _PILImage.fromarray(arr.reshape((h, w, 3)), 'RGB')
+        except ValueError:
+            return
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        with self._frame_lock:
+            self._latest_jpeg = buf.getvalue()
+
     def _on_map(self, msg: OccupancyGrid):
         if not _PIL_AVAILABLE:
             return
@@ -674,12 +905,17 @@ class WebControlNode(Node):
         img = _PILImage.fromarray(np.flipud(rgb), 'RGB')
         buf = io.BytesIO()
         img.save(buf, format='PNG', optimize=True)
+        ox = float(msg.info.origin.position.x)
+        oy = float(msg.info.origin.position.y)
         with self._map_lock:
             self._latest_map_png = buf.getvalue()
+            self._map_origin = (ox, oy)
             self._map_meta = {
                 'resolution': round(float(msg.info.resolution), 4),
                 'width': w,
                 'height': h,
+                'origin_x': round(ox, 4),
+                'origin_y': round(oy, 4),
             }
 
     def _watchdog_cb(self):
@@ -701,6 +937,202 @@ class WebControlNode(Node):
     def get_map_meta(self) -> dict:
         with self._map_lock:
             return dict(self._map_meta)
+
+    def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        cov = msg.pose.covariance
+        with self._amcl_lock:
+            self._amcl_pose = {
+                'x': round(float(msg.pose.pose.position.x), 4),
+                'y': round(float(msg.pose.pose.position.y), 4),
+                'yaw': round(float(yaw), 4),
+                # max of x/y position variance — small => localized/converged
+                'cov': round(float(max(cov[0], cov[7])), 4),
+            }
+
+    def get_robot_pose(self) -> dict:
+        with self._amcl_lock:
+            if self._amcl_pose is None:
+                return {'available': False}
+            p = dict(self._amcl_pose)
+        p['available'] = True
+        p['converged'] = p['cov'] < 0.5
+        return p
+
+    # ---- navigation backend ----------------------------------------------
+
+    def saved_map_yaml(self) -> str:
+        return os.path.join(self._map_dir, self._sim_map_name + '.yaml')
+
+    def has_saved_map(self) -> bool:
+        return os.path.isfile(self.saved_map_yaml())
+
+    def nav_status(self) -> dict:
+        with self._nav_lock:
+            proc, mode = self._nav_proc, self._nav_mode
+        running = mode if (proc is not None and proc.poll() is None) else None
+        return {
+            'sim': self._sim,
+            'running': running,
+            'has_map': self.has_saved_map(),
+            'have_live_map': bool(self.get_map_meta()),
+        }
+
+    # Nav node processes that must be gone before a new stack starts. Lingering
+    # ones (from a previous mapping/navigation run) collide by name and make the
+    # new bt_navigator flap active->inactive -> intermittent "robot won't move".
+    _NAV_PROC_PATTERNS = (
+        'controller_server', 'planner_server', 'bt_navigator', 'behavior_server',
+        'smoother_server', 'velocity_smoother', 'waypoint_follower',
+        'lifecycle_manager_navigation', 'async_slam_toolbox_node', 'amcl', 'map_server',
+    )
+
+    def _launch_nav(self, mode: str, launch_file: str, extra: list) -> None:
+        self.stop_nav()
+        # Belt-and-suspenders clean slate: kill any nav nodes the group-kill missed.
+        for pat in self._NAV_PROC_PATTERNS:
+            subprocess.run(['pkill', '-9', '-f', pat], capture_output=True)
+        time.sleep(1.0)
+        ust = 'true' if self._sim else 'false'
+        cmd = ['ros2', 'launch', 'jetank_navigation', launch_file,
+               f'use_sim_time:={ust}'] + extra
+        logf = open(os.path.join('/tmp', f'jetank_nav_{mode}.log'), 'wb')
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                start_new_session=True, env=os.environ)
+        with self._nav_lock:
+            self._nav_proc, self._nav_mode = proc, mode
+        self.get_logger().info(f'nav stack started [{mode}]: {" ".join(cmd)}')
+
+    def start_mapping(self) -> tuple:
+        self._launch_nav('mapping', 'slam_nav2.launch.py', [])
+        return True, 'mapping started (slam_toolbox + nav2)'
+
+    def start_navigation(self) -> tuple:
+        if not self.has_saved_map():
+            return False, 'no saved map — run mapping and Save Map first'
+        self._launch_nav('navigation', 'nav2_bringup.launch.py',
+                          [f'map:={self.saved_map_yaml()}'])
+        # AMCL needs an initial pose or it never publishes map->odom (nav is then
+        # dead). Seed /initialpose a few times once AMCL has come up.
+        threading.Thread(target=self._seed_initial_pose, daemon=True).start()
+        return True, f'navigation started on {self.saved_map_yaml()}'
+
+    def _seed_initial_pose(self):
+        x = float(self.get_parameter('initial_pose_x').value)
+        y = float(self.get_parameter('initial_pose_y').value)
+        yaw = float(self.get_parameter('initial_pose_yaw').value)
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = 'map'
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        cov = [0.0] * 36
+        cov[0] = cov[7] = 0.25       # x, y variance
+        cov[35] = 0.0685             # yaw variance
+        msg.pose.covariance = cov
+        # Keep re-publishing until AMCL actually converges near the seed. A single
+        # early publish is lost because AMCL is not subscribed yet during bringup
+        # under load; this loop guarantees one lands once AMCL is ready.
+        for _ in range(25):
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self._initpose_pub.publish(msg)
+            time.sleep(1.2)
+            with self._amcl_lock:
+                ap = dict(self._amcl_pose) if self._amcl_pose else None
+            if ap and abs(ap['x'] - x) < 0.5 and abs(ap['y'] - y) < 0.5:
+                self.get_logger().info(
+                    f'AMCL accepted initial pose ({x:.2f}, {y:.2f}, {yaw:.2f})')
+                return
+        self.get_logger().warn('AMCL did not converge to the seeded initial pose')
+
+    def stop_nav(self) -> Optional[str]:
+        with self._amcl_lock:
+            self._amcl_pose = None    # re-determine pose on the next navigation
+        with self._nav_lock:
+            proc, mode = self._nav_proc, self._nav_mode
+            self._nav_proc, self._nav_mode = None, None
+        if proc is not None and proc.poll() is None:
+            # Kill the whole launch process group and WAIT for it to die, so a
+            # following start_* gets a clean slate (otherwise the old
+            # lifecycle_manager/amcl linger and fight the new stack).
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                proc.wait(timeout=8.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=3.0)
+                except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+                    pass
+        return mode
+
+    def save_map(self) -> tuple:
+        os.makedirs(self._map_dir, exist_ok=True)
+        path = os.path.join(self._map_dir, self._sim_map_name)
+        # In sim, map_saver_cli must use the sim clock or it times out waiting on
+        # /map ("Failed to spin map subscription"). Also give it a longer window.
+        cmd = ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', path,
+               '--ros-args',
+               '-p', f'use_sim_time:={str(self._sim).lower()}',
+               '-p', 'save_map_timeout:=10.0']
+        try:
+            res = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=20, env=os.environ)
+        except subprocess.TimeoutExpired:
+            return False, 'map_saver_cli timed out'
+        except FileNotFoundError:
+            return False, 'ros2 command not found'
+        if res.returncode == 0:
+            return True, path + '.yaml'
+        return False, (res.stderr.strip() or res.stdout.strip() or 'map_saver failed')
+
+    def navigate_to_pixel(self, ix: int, iy: int) -> tuple:
+        """Convert a click on the rendered /map.png (which is vertically
+        flipped) to a map-frame pose and send a NavigateToPose goal."""
+        with self._map_lock:
+            meta = dict(self._map_meta)
+            ox, oy = self._map_origin
+        if not meta:
+            return False, 'no map yet'
+        res, w, h = meta['resolution'], meta['width'], meta['height']
+        ix = max(0, min(w - 1, int(ix)))
+        iy = max(0, min(h - 1, int(iy)))
+        grid_row = (h - 1) - iy   # the PNG was flipud'd before serving
+        wx = ox + (ix + 0.5) * res
+        wy = oy + (grid_row + 0.5) * res
+
+        if not self._nav_client.server_is_ready():
+            if not self._nav_client.wait_for_server(timeout_sec=2.0):
+                return False, 'nav2 not ready — start mapping or navigation first'
+
+        ps = PoseStamped()
+        ps.header.frame_id = 'map'
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = wx
+        ps.pose.position.y = wy
+        ps.pose.orientation.w = 1.0
+        goal = NavigateToPose.Goal()
+        goal.pose = ps
+        self._nav_client.send_goal_async(goal).add_done_callback(self._on_goal_response)
+        self.get_logger().info(f'NavigateToPose goal -> map ({wx:.2f}, {wy:.2f})')
+        return True, {'x': round(wx, 3), 'y': round(wy, 3)}
+
+    def _on_goal_response(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'NavigateToPose send failed: {exc}')
+            return
+        if not handle.accepted:
+            self.get_logger().warn('NavigateToPose goal REJECTED')
+            return
+        self.get_logger().info('NavigateToPose goal accepted')
 
     def apply_cmd(self, linear_x: float, angular_z: float):
         lx = max(-1.0, min(1.0, linear_x))  * self._max_linear
@@ -797,25 +1229,53 @@ async def handle_map_meta(request: web.Request) -> web.Response:
 
 
 async def handle_save_map(request: web.Request) -> web.Response:
-    ts = time.strftime('%Y%m%d_%H%M%S')
-    map_dir = os.path.expanduser('~/maps')
-    os.makedirs(map_dir, exist_ok=True)
-    map_path = os.path.join(map_dir, f'jetank_map_{ts}')
+    node: WebControlNode = request.app['node']
+    ok, info = node.save_map()
+    if ok:
+        return web.json_response({'status': 'ok', 'path': info})
+    return web.json_response({'status': 'error', 'msg': info}, status=500)
+
+
+async def handle_start_mapping(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, msg = node.start_mapping()
+    return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
+                             status=200 if ok else 400)
+
+
+async def handle_start_navigation(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, msg = node.start_navigation()
+    return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
+                             status=200 if ok else 400)
+
+
+async def handle_stop_nav(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    mode = node.stop_nav()
+    return web.json_response({'status': 'ok', 'stopped': mode})
+
+
+async def handle_nav_status(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.nav_status())
+
+
+async def handle_robot_pose(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.get_robot_pose())
+
+
+async def handle_navigate(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
     try:
-        result = subprocess.run(
-            ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', map_path],
-            capture_output=True, text=True, timeout=15, env=os.environ,
-        )
-        if result.returncode == 0:
-            return web.json_response({'status': 'ok', 'path': map_path})
-        return web.json_response(
-            {'status': 'error', 'msg': result.stderr.strip() or result.stdout.strip()},
-            status=500,
-        )
-    except subprocess.TimeoutExpired:
-        return web.json_response({'status': 'error', 'msg': 'map_saver_cli timed out'}, status=500)
-    except FileNotFoundError:
-        return web.json_response({'status': 'error', 'msg': 'ros2 command not found'}, status=500)
+        data = await request.json()
+        ok, info = node.navigate_to_pixel(int(data['x']), int(data['y']))
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
+    if ok:
+        return web.json_response({'status': 'ok', 'goal': info})
+    return web.json_response({'status': 'error', 'msg': info}, status=409)
 
 
 # ---------------------------------------------------------------------------
@@ -831,6 +1291,12 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/map.png', handle_map_png)
     app.router.add_get('/map_meta', handle_map_meta)
     app.router.add_post('/save_map', handle_save_map)
+    app.router.add_post('/start_mapping', handle_start_mapping)
+    app.router.add_post('/start_navigation', handle_start_navigation)
+    app.router.add_post('/stop_nav', handle_stop_nav)
+    app.router.add_get('/nav_status', handle_nav_status)
+    app.router.add_get('/robot_pose', handle_robot_pose)
+    app.router.add_post('/navigate', handle_navigate)
     return app
 
 
@@ -864,6 +1330,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_nav()
         node.destroy_node()
         rclpy.shutdown()
         ros_thread.join(timeout=2.0)

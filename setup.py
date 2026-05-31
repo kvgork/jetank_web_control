@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'web_control_node = jetank_web_control.web_control_node:main',
+            'cmd_vel_bridge = jetank_web_control.cmd_vel_bridge:main',
         ],
     },
 )

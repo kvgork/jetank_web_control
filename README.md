@@ -62,6 +62,68 @@ ros2 launch jetank_ros_main unified.launch.py
 ros2 launch jetank_ros_main unified.launch.py enable_web_control:=false
 ```
 
+### In simulation (Gazebo)
+
+The web control also drives the **Gazebo** robot. Two mismatches are handled by
+`sim:=true`:
+
+- Gazebo's `diff_drive_controller` wants `TwistStamped` on
+  `/diff_drive_controller/cmd_vel`, but the web UI publishes `Twist` on
+  `/cmd_vel`. `sim:=true` starts a `cmd_vel_bridge` node that relays
+  `Twist → TwistStamped`.
+- Gazebo publishes a **raw** camera Image (no compressed transport plugin), so
+  `sim:=true` switches the node to subscribe to the raw `Image` topic and
+  JPEG-encodes it locally.
+
+```bash
+# Standalone (a Gazebo sim must already be running)
+ros2 launch jetank_web_control web_control.launch.py sim:=true
+
+# Or fold into the unified sim in one command:
+ros2 launch jetank_ros_main sim_demo.launch.py web:=true
+```
+
+Then open `http://localhost:8080`. Verified: driving from the browser moves the
+robot in Gazebo, and the camera feed streams.
+
+### Mapping & navigation from the browser (Nav2)
+
+The desktop layout shows a **live map directly under the camera feed**. It drives
+the full SLAM + Nav2 stack and supports click-to-navigate:
+
+1. **Start Mapping** — launches `jetank_navigation/slam_nav2.launch.py`
+   (slam_toolbox online mapping + Nav2 navigation-only via `navigation_only.launch.py`;
+   slam supplies `/map` and `map -> odom`, so no AMCL/map_server). Live map appears.
+2. Drive around (WASD / joystick) to build the map.
+3. **Click anywhere on the map** → sends a `NavigateToPose` goal at that point
+   (click pixel → map-frame metres via origin + resolution). The robot drives there.
+4. **Save Map** — writes a canonical `~/maps/sim_map.{yaml,pgm}`
+   (map_saver runs with `use_sim_time`).
+5. **Navigate (saved map)** — enabled once a saved map exists; launches
+   `nav2_bringup.launch.py map:=~/maps/sim_map.yaml` (map_server + AMCL + Nav2).
+   It first **localizes**: a "Determining robot position…" loader shows while AMCL
+   converges, then a **red pose arrow** is drawn on the map at the robot's
+   estimated position + heading (updated live).
+6. **Stop** — shuts the nav stack down.
+
+Endpoints: `POST /start_mapping`, `POST /start_navigation`, `POST /stop_nav`,
+`GET /nav_status`, `GET /robot_pose`, `POST /navigate {x,y}` (map-image pixel).
+
+**Velocity muxing:** the web teleop publishes `/cmd_vel_teleop` and Nav2 publishes
+`/cmd_vel`; `cmd_vel_bridge` muxes them (teleop wins only while actively non-zero)
+and republishes `TwistStamped` to `/diff_drive_controller/cmd_vel`. This stops the
+teleop watchdog's idle zeros and Nav2 from fighting over one topic.
+
+**Notes / known limits:**
+- **Saved-map mode needs a map that matches the live world** and the robot to start
+  at the seeded pose (`initial_pose_*` params, default origin). AMCL is seeded via
+  `/initialpose` (re-published until it converges). If the robot starts elsewhere,
+  localization will be wrong — a "click to set pose" control is a future addition.
+- The **Start Mapping** path is the most robust for navigation (slam_toolbox gives
+  continuous localization, no AMCL init/lifecycle fragility).
+- Costmap `inflation_radius` (0.18) / `robot_radius` (0.12) are tuned for the small
+  JeTank; adjust in `jetank_navigation/config/nav2/nav2_params.yaml`.
+
 ### 4. Open the controller
 
 Find the Jetson's IP address:
@@ -106,6 +168,10 @@ Use the **Speed** slider to limit maximum velocity.
 | `max_linear_speed` | `0.5` | Maximum linear speed (m/s) — UI scale maps to this |
 | `max_angular_speed` | `1.0` | Maximum angular speed (rad/s) |
 | `cmd_timeout_sec` | `0.5` | Stop robot if no WebSocket message received for this long |
+| `image_compressed` | `true` | `true` = subscribe `CompressedImage`; `false` = raw `Image` + local JPEG encode (sim) |
+
+Launch-only args: `sim` (`false`) enables sim mode (bridge + raw image + use_sim_time);
+`output_cmd_vel` (`/diff_drive_controller/cmd_vel`) is the bridge's TwistStamped output topic.
 
 Override at launch:
 
