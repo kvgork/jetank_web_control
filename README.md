@@ -62,6 +62,30 @@ ros2 launch jetank_ros_main unified.launch.py
 ros2 launch jetank_ros_main unified.launch.py enable_web_control:=false
 ```
 
+### In simulation (Gazebo)
+
+The web control also drives the **Gazebo** robot. Two mismatches are handled by
+`sim:=true`:
+
+- Gazebo's `diff_drive_controller` wants `TwistStamped` on
+  `/diff_drive_controller/cmd_vel`, but the web UI publishes `Twist` on
+  `/cmd_vel`. `sim:=true` starts a `cmd_vel_bridge` node that relays
+  `Twist → TwistStamped`.
+- Gazebo publishes a **raw** camera Image (no compressed transport plugin), so
+  `sim:=true` switches the node to subscribe to the raw `Image` topic and
+  JPEG-encodes it locally.
+
+```bash
+# Standalone (a Gazebo sim must already be running)
+ros2 launch jetank_web_control web_control.launch.py sim:=true
+
+# Or fold into the unified sim in one command:
+ros2 launch jetank_ros_main sim_demo.launch.py web:=true
+```
+
+Then open `http://localhost:8080`. Verified: driving from the browser moves the
+robot in Gazebo, and the camera feed streams.
+
 ### 4. Open the controller
 
 Find the Jetson's IP address:
@@ -106,6 +130,10 @@ Use the **Speed** slider to limit maximum velocity.
 | `max_linear_speed` | `0.5` | Maximum linear speed (m/s) — UI scale maps to this |
 | `max_angular_speed` | `1.0` | Maximum angular speed (rad/s) |
 | `cmd_timeout_sec` | `0.5` | Stop robot if no WebSocket message received for this long |
+| `image_compressed` | `true` | `true` = subscribe `CompressedImage`; `false` = raw `Image` + local JPEG encode (sim) |
+
+Launch-only args: `sim` (`false`) enables sim mode (bridge + raw image + use_sim_time);
+`output_cmd_vel` (`/diff_drive_controller/cmd_vel`) is the bridge's TwistStamped output topic.
 
 Override at launch:
 

@@ -28,7 +28,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, Image
 
 try:
     import numpy as np
@@ -625,6 +625,10 @@ class WebControlNode(Node):
         self.declare_parameter('max_linear_speed', 0.5)
         self.declare_parameter('max_angular_speed', 1.0)
         self.declare_parameter('cmd_timeout_sec', 0.5)
+        # When false, subscribe to a raw sensor_msgs/Image and JPEG-encode it
+        # locally (used in simulation, where Gazebo publishes raw Image and the
+        # compressed_image_transport plugin is not available).
+        self.declare_parameter('image_compressed', True)
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -632,6 +636,7 @@ class WebControlNode(Node):
         self._max_linear = self.get_parameter('max_linear_speed').value
         self._max_angular = self.get_parameter('max_angular_speed').value
         self._cmd_timeout = self.get_parameter('cmd_timeout_sec').value
+        image_compressed = self.get_parameter('image_compressed').value
 
         self._frame_lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
@@ -644,7 +649,10 @@ class WebControlNode(Node):
         self._map_meta: dict = {}
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
-        self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
+        if image_compressed:
+            self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
+        else:
+            self.create_subscription(Image, image_topic, self._on_raw_image, 10)
         self.create_subscription(OccupancyGrid, '/map', self._on_map, 1)
 
         # Watchdog: stop robot if commands stop arriving
@@ -660,6 +668,33 @@ class WebControlNode(Node):
     def _on_image(self, msg: CompressedImage):
         with self._frame_lock:
             self._latest_jpeg = bytes(msg.data)
+
+    def _on_raw_image(self, msg: Image):
+        # Encode a raw sensor_msgs/Image to JPEG (simulation path). Supports the
+        # common rgb8/bgr8 encodings; falls back to mono treatment otherwise.
+        if not _PIL_AVAILABLE:
+            return
+        h, w = msg.height, msg.width
+        if h == 0 or w == 0:
+            return
+        arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        enc = msg.encoding.lower()
+        try:
+            if enc in ('rgb8', 'bgr8'):
+                arr = arr.reshape((h, w, 3))
+                if enc == 'bgr8':
+                    arr = arr[:, :, ::-1]
+                img = _PILImage.fromarray(arr, 'RGB')
+            elif enc in ('mono8', '8uc1'):
+                img = _PILImage.fromarray(arr.reshape((h, w)), 'L')
+            else:  # best-effort: assume 3-channel
+                img = _PILImage.fromarray(arr.reshape((h, w, 3)), 'RGB')
+        except ValueError:
+            return
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        with self._frame_lock:
+            self._latest_jpeg = buf.getvalue()
 
     def _on_map(self, msg: OccupancyGrid):
         if not _PIL_AVAILABLE:
