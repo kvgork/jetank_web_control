@@ -621,18 +621,20 @@ function drawRobotArrow(p) {
   const img = document.getElementById('map-img');
   const cv = document.getElementById('map-overlay');
   if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return;
-  const wrap = img.parentElement;
-  cv.width = wrap.clientWidth; cv.height = wrap.clientHeight;
-  const ctx = cv.getContext('2d');
-  ctx.clearRect(0, 0, cv.width, cv.height);
-  const natW = img.naturalWidth, natH = img.naturalHeight;
-  const scale = Math.min(cv.width / natW, cv.height / natH);
-  const ox = (cv.width - natW * scale) / 2;
-  const oy = (cv.height - natH * scale) / 2;
+  // Match the drawing buffer to the canvas CSS box, then place the arrow using
+  // the IMG's real rendered rect (handles object-fit:contain + padding/centering).
+  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
+  const ir = img.getBoundingClientRect();
+  const cr = cv.getBoundingClientRect();
+  const sx = ir.width / img.naturalWidth;
+  const sy = ir.height / img.naturalHeight;
   const col = (p.x - lastMeta.origin_x) / lastMeta.resolution;
   const gridRow = (p.y - lastMeta.origin_y) / lastMeta.resolution;
   const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is vertically flipped
-  const px = ox + ix * scale, py = oy + iy * scale;
+  const px = (ir.left - cr.left) + ix * sx;
+  const py = (ir.top - cr.top) + iy * sy;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
   ctx.save();
   ctx.translate(px, py);
   ctx.rotate(-p.yaw);                  // image y is down => screen angle = -yaw
