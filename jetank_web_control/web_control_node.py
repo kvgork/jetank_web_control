@@ -167,7 +167,7 @@ _HTML = """<!DOCTYPE html>
   #map-img{image-rendering:pixelated;width:100%;height:100%;
            object-fit:contain;display:block;opacity:.3}
   #map-img.loaded{opacity:1}
-  #map-overlay{position:absolute;inset:0;pointer-events:none}
+  #map-overlay{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none}
   #map-loading{position:absolute;inset:0;display:none;flex-direction:column;
                gap:10px;align-items:center;justify-content:center;
                background:rgba(1,4,9,.66);color:#e6edf3;font-size:.78rem}
