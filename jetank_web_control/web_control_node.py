@@ -894,10 +894,15 @@ class WebControlNode(Node):
     def save_map(self) -> tuple:
         os.makedirs(self._map_dir, exist_ok=True)
         path = os.path.join(self._map_dir, self._sim_map_name)
+        # In sim, map_saver_cli must use the sim clock or it times out waiting on
+        # /map ("Failed to spin map subscription"). Also give it a longer window.
+        cmd = ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', path,
+               '--ros-args',
+               '-p', f'use_sim_time:={str(self._sim).lower()}',
+               '-p', 'save_map_timeout:=10.0']
         try:
             res = subprocess.run(
-                ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', path],
-                capture_output=True, text=True, timeout=20, env=os.environ)
+                cmd, capture_output=True, text=True, timeout=20, env=os.environ)
         except subprocess.TimeoutExpired:
             return False, 'map_saver_cli timed out'
         except FileNotFoundError:
