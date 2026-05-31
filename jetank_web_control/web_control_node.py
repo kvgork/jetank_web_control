@@ -182,6 +182,9 @@ _HTML = """<!DOCTYPE html>
   .mbtn:hover{background:#30363d}.mbtn:active{background:#58a6ff22}
   .mbtn:disabled{opacity:.5;cursor:default}
   .map-save-sts{font-size:.65rem;flex:1}
+  .capture-bar{display:flex;align-items:center;gap:8px;padding:6px 8px;
+        background:#161b22;border-top:1px solid #30363d}
+  .capture-sts{font-size:.7rem;color:#8b949e;font-family:monospace}
   /* mapping toggle at bottom of sidebar */
   .sidebar-footer{margin-top:auto;padding-top:10px;border-top:1px solid #30363d}
   /* never show map panel on touch */
@@ -208,6 +211,12 @@ _HTML = """<!DOCTYPE html>
     <img id="cam-img" src="/stream.mjpg" alt="camera"
          onerror="scheduleReconnectStream()" onload="onImgLoad()">
     <div class="cam-overlay">left camera</div>
+  </div>
+
+  <!-- capture bar: save the current frame to the robot for dataset building -->
+  <div class="capture-bar">
+    <button class="mbtn" id="capture-btn" onclick="capture()">&#x1F4F7; Capture</button>
+    <span class="capture-sts" id="capture-sts">0 saved</span>
   </div>
 
   <!-- mapping panel: desktop only, shown when mapping mode is active -->
@@ -697,6 +706,25 @@ function navMsg(text, ok) {
   sts.textContent = text;
 }
 
+function capture() {
+  const btn = document.getElementById('capture-btn');
+  const sts = document.getElementById('capture-sts');
+  btn.disabled = true;
+  fetch('/capture', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        sts.style.color = '#3fb950';
+        sts.textContent = d.count + ' saved \\u00B7 ' + d.filename;
+      } else {
+        sts.style.color = '#f85149';
+        sts.textContent = d.error || 'capture failed';
+      }
+    })
+    .catch(() => { sts.style.color = '#f85149'; sts.textContent = 'request failed'; })
+    .finally(() => { btn.disabled = false; });
+}
+
 function refreshNavStatus() {
   fetch('/nav_status')
     .then(r => r.ok ? r.json() : null)
@@ -809,6 +837,8 @@ class WebControlNode(Node):
         self.declare_parameter('initial_pose_x', 0.0)
         self.declare_parameter('initial_pose_y', 0.0)
         self.declare_parameter('initial_pose_yaw', 0.0)
+        # Persistent dir on the robot for captured training images (NOT /tmp).
+        self.declare_parameter('capture_dir', os.path.expanduser('~/datasets/detection'))
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -823,6 +853,21 @@ class WebControlNode(Node):
 
         self._frame_lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
+
+        # Image capture (persistent, for detection-model training datasets).
+        self._capture_dir = os.path.expanduser(
+            self.get_parameter('capture_dir').value)
+        os.makedirs(self._capture_dir, exist_ok=True)
+        self._capture_lock = threading.Lock()
+        self._capture_seq = 0
+        # Seed the saved-count once so each capture doesn't re-scan the dir
+        # (it is expected to grow large). Counter is maintained in memory after.
+        try:
+            self._capture_count = sum(
+                1 for n in os.listdir(self._capture_dir)
+                if n.lower().endswith('.jpg'))
+        except OSError:
+            self._capture_count = 0
 
         self._cmd_lock = threading.Lock()
         self._last_cmd_time = 0.0
@@ -929,6 +974,42 @@ class WebControlNode(Node):
     def get_frame(self) -> Optional[bytes]:
         with self._frame_lock:
             return self._latest_jpeg
+
+    def save_capture(self):
+        """Persist the current full-res frame as a JPEG in capture_dir.
+
+        Reuses the streamed frame (already JPEG: passthrough on the robot's
+        CompressedImage path, re-encoded on the sim raw-Image path), so no
+        decode/re-encode is needed here. Returns (ok, info|error_str).
+        """
+        frame = self.get_frame()
+        if frame is None:
+            return False, 'no camera frame available yet'
+        with self._capture_lock:
+            # Timestamp-only flat filename; seq disambiguates same-second bursts.
+            # Exclusive-create ('xb') guarantees we never overwrite an existing
+            # file even across process restarts (where _capture_seq resets to 0):
+            # on collision we bump the seq and retry rather than truncate data.
+            ts = time.strftime('%Y%m%dT%H%M%S')
+            for _ in range(100000):
+                self._capture_seq += 1
+                fname = f'{ts}_{self._capture_seq:04d}.jpg'
+                path = os.path.join(self._capture_dir, fname)
+                try:
+                    with open(path, 'xb') as f:
+                        f.write(frame)
+                    break
+                except FileExistsError:
+                    continue
+                except OSError as e:
+                    return False, f'write failed: {e}'
+            else:
+                return False, 'could not allocate a unique capture filename'
+            self._capture_count += 1
+            count = self._capture_count
+        self.get_logger().info(
+            f'captured {fname} ({len(frame)} bytes) -> {self._capture_dir}')
+        return True, {'filename': fname, 'count': count, 'dir': self._capture_dir}
 
     def get_map_png(self) -> Optional[bytes]:
         with self._map_lock:
@@ -1278,6 +1359,14 @@ async def handle_navigate(request: web.Request) -> web.Response:
     return web.json_response({'status': 'error', 'msg': info}, status=409)
 
 
+async def handle_capture(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, info = node.save_capture()
+    if ok:
+        return web.json_response({'ok': True, **info})
+    return web.json_response({'ok': False, 'error': info}, status=503)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -1297,6 +1386,7 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/nav_status', handle_nav_status)
     app.router.add_get('/robot_pose', handle_robot_pose)
     app.router.add_post('/navigate', handle_navigate)
+    app.router.add_post('/capture', handle_capture)
     return app
 
 
