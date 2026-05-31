@@ -164,7 +164,7 @@ _HTML = """<!DOCTYPE html>
   .map-meta-txt{font-size:.65rem;color:#8b949e}
   .map-canvas-wrap{position:relative;flex:1;overflow:hidden;display:flex;
                    align-items:center;justify-content:center;padding:4px}
-  #map-img{image-rendering:pixelated;max-width:100%;max-height:100%;
+  #map-img{image-rendering:pixelated;width:100%;height:100%;
            object-fit:contain;display:block;opacity:.3}
   #map-img.loaded{opacity:1}
   #map-overlay{position:absolute;inset:0;pointer-events:none}
@@ -621,26 +621,30 @@ function drawRobotArrow(p) {
   const img = document.getElementById('map-img');
   const cv = document.getElementById('map-overlay');
   if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return;
-  // Match the drawing buffer to the canvas CSS box, then place the arrow using
-  // the IMG's real rendered rect (handles object-fit:contain + padding/centering).
   cv.width = cv.clientWidth; cv.height = cv.clientHeight;
-  const ir = img.getBoundingClientRect();
+  if (!cv.width || !cv.height) return;
+  const er = img.getBoundingClientRect();   // img ELEMENT box (fills the wrap)
   const cr = cv.getBoundingClientRect();
-  const sx = ir.width / img.naturalWidth;
-  const sy = ir.height / img.naturalHeight;
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  // The image is letterboxed inside the element by object-fit:contain — compute
+  // the actual rendered image rect, not the element box.
+  const scale = Math.min(er.width / natW, er.height / natH);
+  const cw = natW * scale, ch = natH * scale;
+  const contentLeft = er.left + (er.width - cw) / 2;
+  const contentTop = er.top + (er.height - ch) / 2;
   const col = (p.x - lastMeta.origin_x) / lastMeta.resolution;
   const gridRow = (p.y - lastMeta.origin_y) / lastMeta.resolution;
   const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is vertically flipped
-  const px = (ir.left - cr.left) + ix * sx;
-  const py = (ir.top - cr.top) + iy * sy;
+  const px = (contentLeft - cr.left) + ix * scale;
+  const py = (contentTop - cr.top) + iy * scale;
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, cv.width, cv.height);
   ctx.save();
   ctx.translate(px, py);
   ctx.rotate(-p.yaw);                  // image y is down => screen angle = -yaw
-  ctx.fillStyle = '#ff3b30'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+  ctx.fillStyle = '#ff3b30'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
   ctx.beginPath();
-  ctx.moveTo(13, 0); ctx.lineTo(-8, -7); ctx.lineTo(-3, 0); ctx.lineTo(-8, 7);
+  ctx.moveTo(16, 0); ctx.lineTo(-10, -9); ctx.lineTo(-4, 0); ctx.lineTo(-10, 9);
   ctx.closePath(); ctx.fill(); ctx.stroke();
   ctx.restore();
 }
