@@ -40,6 +40,7 @@ def launch_setup(context, *args, **kwargs):
             'max_linear_speed':  LaunchConfiguration('max_linear'),
             'max_angular_speed': LaunchConfiguration('max_angular'),
             'use_sim_time':      sim,
+            'sim':               sim,
         }],
     )
 

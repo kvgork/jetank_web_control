@@ -18,7 +18,9 @@ Endpoints:
 import asyncio
 import io
 import json
+import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -26,9 +28,11 @@ from typing import Optional
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from rclpy.action import ActionClient
+from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage, Image
+from nav2_msgs.action import NavigateToPose
 
 try:
     import numpy as np
@@ -203,13 +207,18 @@ _HTML = """<!DOCTYPE html>
       <span class="map-meta-txt" id="map-meta-txt">Waiting for /map topic&#x2026;</span>
     </div>
     <div class="map-canvas-wrap">
-      <img id="map-img" src="" alt=""
+      <img id="map-img" src="" alt="" style="cursor:crosshair"
+           onclick="mapClick(event)"
            onload="this.classList.add('loaded')"
            onerror="this.classList.remove('loaded');document.getElementById('map-meta-txt').textContent='Waiting for /map topic&#x2026;'">
     </div>
     <div class="map-footer">
+      <button class="mbtn" id="start-map-btn" onclick="startMapping()">Start Mapping</button>
+      <button class="mbtn" id="start-nav-btn" onclick="startNavigation()" disabled>Navigate (saved map)</button>
       <button class="mbtn" id="save-map-btn" onclick="saveMap()">Save Map</button>
+      <button class="mbtn" id="stop-nav-btn" onclick="stopNav()">Stop</button>
       <span class="map-save-sts" id="map-save-sts"></span>
+      <div class="map-hint" id="nav-hint">Start mapping (or load a saved map), then click the map to send the robot there.</div>
     </div>
   </div>
 
@@ -557,7 +566,8 @@ function toggleMappingMode() {
 
 function startMapRefresh() {
   refreshMap();
-  mapRefreshTimer = setInterval(refreshMap, 1500);
+  refreshNavStatus();
+  mapRefreshTimer = setInterval(() => { refreshMap(); refreshNavStatus(); }, 1500);
 }
 
 function stopMapRefresh() {
@@ -601,6 +611,73 @@ function saveMap() {
     .finally(() => { btn.disabled = false; btn.textContent = 'Save Map'; });
 }
 
+function navMsg(text, ok) {
+  const sts = document.getElementById('map-save-sts');
+  sts.style.color = ok ? '#3fb950' : '#f85149';
+  sts.textContent = text;
+}
+
+function refreshNavStatus() {
+  fetch('/nav_status')
+    .then(r => r.ok ? r.json() : null)
+    .then(s => {
+      if (!s) return;
+      document.getElementById('start-nav-btn').disabled = !s.has_map;
+      const hint = document.getElementById('nav-hint');
+      if (s.running === 'mapping')      hint.textContent = 'Mapping active \\u00B7 drive to build the map, then click it to navigate.';
+      else if (s.running === 'navigation') hint.textContent = 'Navigation active (saved map) \\u00B7 click the map to send the robot.';
+      else hint.textContent = s.has_map ? 'Saved map available \\u00B7 Start Mapping or Navigate (saved map).'
+                                        : 'Start Mapping, drive around, then Save Map.';
+    })
+    .catch(() => {});
+}
+
+function startMapping() {
+  navMsg('Starting mapping\\u2026', true);
+  fetch('/start_mapping', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => navMsg(d.status === 'ok' ? '\\u2713 mapping started' : (d.msg || 'error'), d.status === 'ok'))
+    .catch(() => navMsg('Request failed', false))
+    .finally(refreshNavStatus);
+}
+
+function startNavigation() {
+  navMsg('Starting navigation\\u2026', true);
+  fetch('/start_navigation', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => navMsg(d.status === 'ok' ? '\\u2713 navigation started' : (d.msg || 'error'), d.status === 'ok'))
+    .catch(() => navMsg('Request failed', false))
+    .finally(refreshNavStatus);
+}
+
+function stopNav() {
+  fetch('/stop_nav', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => navMsg('Stopped ' + (d.stopped || 'nav'), true))
+    .catch(() => navMsg('Request failed', false))
+    .finally(refreshNavStatus);
+}
+
+function mapClick(ev) {
+  const img = document.getElementById('map-img');
+  if (!img.naturalWidth) return;
+  const r = img.getBoundingClientRect();
+  const x = Math.round((ev.clientX - r.left) / r.width  * img.naturalWidth);
+  const y = Math.round((ev.clientY - r.top)  / r.height * img.naturalHeight);
+  navMsg('Sending goal\\u2026', true);
+  fetch('/navigate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({x: x, y: y}),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.status === 'ok') navMsg('\\u2713 goal (' + d.goal.x + ', ' + d.goal.y + ') m', true);
+      else navMsg(d.msg || 'goal rejected', false);
+    })
+    .catch(() => navMsg('Request failed', false));
+}
+
 // ===========================================================================
 // Boot
 // ===========================================================================
@@ -629,6 +706,11 @@ class WebControlNode(Node):
         # locally (used in simulation, where Gazebo publishes raw Image and the
         # compressed_image_transport plugin is not available).
         self.declare_parameter('image_compressed', True)
+        # Simulation mode: nav launches use the sim clock and maps live under a
+        # canonical name so a previously-made sim map can be reused.
+        self.declare_parameter('sim', False)
+        self.declare_parameter('map_dir', os.path.expanduser('~/maps'))
+        self.declare_parameter('sim_map_name', 'sim_map')
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -637,6 +719,9 @@ class WebControlNode(Node):
         self._max_angular = self.get_parameter('max_angular_speed').value
         self._cmd_timeout = self.get_parameter('cmd_timeout_sec').value
         image_compressed = self.get_parameter('image_compressed').value
+        self._sim = bool(self.get_parameter('sim').value)
+        self._map_dir = os.path.expanduser(self.get_parameter('map_dir').value)
+        self._sim_map_name = self.get_parameter('sim_map_name').value
 
         self._frame_lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
@@ -647,6 +732,13 @@ class WebControlNode(Node):
         self._map_lock = threading.Lock()
         self._latest_map_png: Optional[bytes] = None
         self._map_meta: dict = {}
+        self._map_origin = (0.0, 0.0)   # (x, y) of map cell (0,0) in the map frame
+
+        # Navigation stack lifecycle (a launched ros2 process) + goal action client.
+        self._nav_lock = threading.Lock()
+        self._nav_proc: Optional[subprocess.Popen] = None
+        self._nav_mode: Optional[str] = None   # 'mapping' | 'navigation' | None
+        self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
         if image_compressed:
@@ -709,12 +801,17 @@ class WebControlNode(Node):
         img = _PILImage.fromarray(np.flipud(rgb), 'RGB')
         buf = io.BytesIO()
         img.save(buf, format='PNG', optimize=True)
+        ox = float(msg.info.origin.position.x)
+        oy = float(msg.info.origin.position.y)
         with self._map_lock:
             self._latest_map_png = buf.getvalue()
+            self._map_origin = (ox, oy)
             self._map_meta = {
                 'resolution': round(float(msg.info.resolution), 4),
                 'width': w,
                 'height': h,
+                'origin_x': round(ox, 4),
+                'origin_y': round(oy, 4),
             }
 
     def _watchdog_cb(self):
@@ -736,6 +833,116 @@ class WebControlNode(Node):
     def get_map_meta(self) -> dict:
         with self._map_lock:
             return dict(self._map_meta)
+
+    # ---- navigation backend ----------------------------------------------
+
+    def saved_map_yaml(self) -> str:
+        return os.path.join(self._map_dir, self._sim_map_name + '.yaml')
+
+    def has_saved_map(self) -> bool:
+        return os.path.isfile(self.saved_map_yaml())
+
+    def nav_status(self) -> dict:
+        with self._nav_lock:
+            proc, mode = self._nav_proc, self._nav_mode
+        running = mode if (proc is not None and proc.poll() is None) else None
+        return {
+            'sim': self._sim,
+            'running': running,
+            'has_map': self.has_saved_map(),
+            'have_live_map': bool(self.get_map_meta()),
+        }
+
+    def _launch_nav(self, mode: str, launch_file: str, extra: list) -> None:
+        self.stop_nav()
+        ust = 'true' if self._sim else 'false'
+        cmd = ['ros2', 'launch', 'jetank_navigation', launch_file,
+               f'use_sim_time:={ust}'] + extra
+        logf = open(os.path.join('/tmp', f'jetank_nav_{mode}.log'), 'wb')
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
+                                start_new_session=True, env=os.environ)
+        with self._nav_lock:
+            self._nav_proc, self._nav_mode = proc, mode
+        self.get_logger().info(f'nav stack started [{mode}]: {" ".join(cmd)}')
+
+    def start_mapping(self) -> tuple:
+        self._launch_nav('mapping', 'slam_nav2.launch.py', [])
+        return True, 'mapping started (slam_toolbox + nav2)'
+
+    def start_navigation(self) -> tuple:
+        if not self.has_saved_map():
+            return False, 'no saved map — run mapping and Save Map first'
+        self._launch_nav('navigation', 'nav2_bringup.launch.py',
+                          [f'map:={self.saved_map_yaml()}'])
+        return True, f'navigation started on {self.saved_map_yaml()}'
+
+    def stop_nav(self) -> Optional[str]:
+        with self._nav_lock:
+            proc, mode = self._nav_proc, self._nav_mode
+            self._nav_proc, self._nav_mode = None, None
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return mode
+
+    def save_map(self) -> tuple:
+        os.makedirs(self._map_dir, exist_ok=True)
+        path = os.path.join(self._map_dir, self._sim_map_name)
+        try:
+            res = subprocess.run(
+                ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', path],
+                capture_output=True, text=True, timeout=20, env=os.environ)
+        except subprocess.TimeoutExpired:
+            return False, 'map_saver_cli timed out'
+        except FileNotFoundError:
+            return False, 'ros2 command not found'
+        if res.returncode == 0:
+            return True, path + '.yaml'
+        return False, (res.stderr.strip() or res.stdout.strip() or 'map_saver failed')
+
+    def navigate_to_pixel(self, ix: int, iy: int) -> tuple:
+        """Convert a click on the rendered /map.png (which is vertically
+        flipped) to a map-frame pose and send a NavigateToPose goal."""
+        with self._map_lock:
+            meta = dict(self._map_meta)
+            ox, oy = self._map_origin
+        if not meta:
+            return False, 'no map yet'
+        res, w, h = meta['resolution'], meta['width'], meta['height']
+        ix = max(0, min(w - 1, int(ix)))
+        iy = max(0, min(h - 1, int(iy)))
+        grid_row = (h - 1) - iy   # the PNG was flipud'd before serving
+        wx = ox + (ix + 0.5) * res
+        wy = oy + (grid_row + 0.5) * res
+
+        if not self._nav_client.server_is_ready():
+            if not self._nav_client.wait_for_server(timeout_sec=2.0):
+                return False, 'nav2 not ready — start mapping or navigation first'
+
+        ps = PoseStamped()
+        ps.header.frame_id = 'map'
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = wx
+        ps.pose.position.y = wy
+        ps.pose.orientation.w = 1.0
+        goal = NavigateToPose.Goal()
+        goal.pose = ps
+        self._nav_client.send_goal_async(goal).add_done_callback(self._on_goal_response)
+        self.get_logger().info(f'NavigateToPose goal -> map ({wx:.2f}, {wy:.2f})')
+        return True, {'x': round(wx, 3), 'y': round(wy, 3)}
+
+    def _on_goal_response(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'NavigateToPose send failed: {exc}')
+            return
+        if not handle.accepted:
+            self.get_logger().warn('NavigateToPose goal REJECTED')
+            return
+        self.get_logger().info('NavigateToPose goal accepted')
 
     def apply_cmd(self, linear_x: float, angular_z: float):
         lx = max(-1.0, min(1.0, linear_x))  * self._max_linear
@@ -832,25 +1039,48 @@ async def handle_map_meta(request: web.Request) -> web.Response:
 
 
 async def handle_save_map(request: web.Request) -> web.Response:
-    ts = time.strftime('%Y%m%d_%H%M%S')
-    map_dir = os.path.expanduser('~/maps')
-    os.makedirs(map_dir, exist_ok=True)
-    map_path = os.path.join(map_dir, f'jetank_map_{ts}')
+    node: WebControlNode = request.app['node']
+    ok, info = node.save_map()
+    if ok:
+        return web.json_response({'status': 'ok', 'path': info})
+    return web.json_response({'status': 'error', 'msg': info}, status=500)
+
+
+async def handle_start_mapping(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, msg = node.start_mapping()
+    return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
+                             status=200 if ok else 400)
+
+
+async def handle_start_navigation(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, msg = node.start_navigation()
+    return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
+                             status=200 if ok else 400)
+
+
+async def handle_stop_nav(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    mode = node.stop_nav()
+    return web.json_response({'status': 'ok', 'stopped': mode})
+
+
+async def handle_nav_status(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.nav_status())
+
+
+async def handle_navigate(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
     try:
-        result = subprocess.run(
-            ['ros2', 'run', 'nav2_map_server', 'map_saver_cli', '-f', map_path],
-            capture_output=True, text=True, timeout=15, env=os.environ,
-        )
-        if result.returncode == 0:
-            return web.json_response({'status': 'ok', 'path': map_path})
-        return web.json_response(
-            {'status': 'error', 'msg': result.stderr.strip() or result.stdout.strip()},
-            status=500,
-        )
-    except subprocess.TimeoutExpired:
-        return web.json_response({'status': 'error', 'msg': 'map_saver_cli timed out'}, status=500)
-    except FileNotFoundError:
-        return web.json_response({'status': 'error', 'msg': 'ros2 command not found'}, status=500)
+        data = await request.json()
+        ok, info = node.navigate_to_pixel(int(data['x']), int(data['y']))
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
+    if ok:
+        return web.json_response({'status': 'ok', 'goal': info})
+    return web.json_response({'status': 'error', 'msg': info}, status=409)
 
 
 # ---------------------------------------------------------------------------
@@ -866,6 +1096,11 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/map.png', handle_map_png)
     app.router.add_get('/map_meta', handle_map_meta)
     app.router.add_post('/save_map', handle_save_map)
+    app.router.add_post('/start_mapping', handle_start_mapping)
+    app.router.add_post('/start_navigation', handle_start_navigation)
+    app.router.add_post('/stop_nav', handle_stop_nav)
+    app.router.add_get('/nav_status', handle_nav_status)
+    app.router.add_post('/navigate', handle_navigate)
     return app
 
 
@@ -899,6 +1134,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_nav()
         node.destroy_node()
         rclpy.shutdown()
         ros_thread.join(timeout=2.0)

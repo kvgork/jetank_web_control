@@ -86,6 +86,32 @@ ros2 launch jetank_ros_main sim_demo.launch.py web:=true
 Then open `http://localhost:8080`. Verified: driving from the browser moves the
 robot in Gazebo, and the camera feed streams.
 
+### Mapping & navigation from the browser (Nav2)
+
+In sim mode the map panel (desktop) drives the full SLAM + Nav2 stack:
+
+1. **Start Mapping** — launches `jetank_navigation/slam_nav2.launch.py`
+   (slam_toolbox online mapping + Nav2 navigation-only; slam supplies `/map`
+   and `map -> odom`, so no AMCL/map_server). The live map appears in the panel.
+2. Drive around (WASD / joystick) to build the map.
+3. **Click anywhere on the map** → sends a `NavigateToPose` goal at that point
+   (the click pixel is converted to map-frame metres using the map origin +
+   resolution). The robot plans and drives there.
+4. **Save Map** — writes a canonical `~/maps/sim_map.{yaml,pgm}`.
+5. **Navigate (saved map)** — enabled once a saved map exists; launches
+   `nav2_bringup.launch.py map:=~/maps/sim_map.yaml` (map_server + AMCL +
+   Nav2) so you can localize + navigate on the previously-made map without
+   re-mapping.
+6. **Stop** — shuts the nav stack down.
+
+Endpoints: `POST /start_mapping`, `POST /start_navigation`, `POST /stop_nav`,
+`GET /nav_status`, `POST /navigate {x,y}` (map-image pixel).
+
+> Nav reliability depends on the world. The bundled `obstacle_course` places
+> obstacles ~0.5 m from spawn, so tightly-spaced goals may trigger Nav2 recovery
+> behaviours. Costmap `robot_radius`/`inflation_radius` were reduced for the
+> small JeTank footprint; tune further or use a sparser world for smoother runs.
+
 ### 4. Open the controller
 
 Find the Jetson's IP address:
