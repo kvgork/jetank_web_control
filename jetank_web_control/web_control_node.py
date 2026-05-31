@@ -863,8 +863,21 @@ class WebControlNode(Node):
             'have_live_map': bool(self.get_map_meta()),
         }
 
+    # Nav node processes that must be gone before a new stack starts. Lingering
+    # ones (from a previous mapping/navigation run) collide by name and make the
+    # new bt_navigator flap active->inactive -> intermittent "robot won't move".
+    _NAV_PROC_PATTERNS = (
+        'controller_server', 'planner_server', 'bt_navigator', 'behavior_server',
+        'smoother_server', 'velocity_smoother', 'waypoint_follower',
+        'lifecycle_manager_navigation', 'async_slam_toolbox_node', 'amcl', 'map_server',
+    )
+
     def _launch_nav(self, mode: str, launch_file: str, extra: list) -> None:
         self.stop_nav()
+        # Belt-and-suspenders clean slate: kill any nav nodes the group-kill missed.
+        for pat in self._NAV_PROC_PATTERNS:
+            subprocess.run(['pkill', '-9', '-f', pat], capture_output=True)
+        time.sleep(1.0)
         ust = 'true' if self._sim else 'false'
         cmd = ['ros2', 'launch', 'jetank_navigation', launch_file,
                f'use_sim_time:={ust}'] + extra
