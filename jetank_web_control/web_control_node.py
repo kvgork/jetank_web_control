@@ -29,7 +29,7 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage, Image
 from nav2_msgs.action import NavigateToPose
@@ -715,6 +715,11 @@ class WebControlNode(Node):
         self.declare_parameter('sim', False)
         self.declare_parameter('map_dir', os.path.expanduser('~/maps'))
         self.declare_parameter('sim_map_name', 'sim_map')
+        # Robot spawn pose in the map frame, used to seed AMCL when navigating on
+        # a saved map (otherwise AMCL never publishes map->odom and nav is dead).
+        self.declare_parameter('initial_pose_x', 0.0)
+        self.declare_parameter('initial_pose_y', 0.0)
+        self.declare_parameter('initial_pose_yaw', 0.0)
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -743,6 +748,7 @@ class WebControlNode(Node):
         self._nav_proc: Optional[subprocess.Popen] = None
         self._nav_mode: Optional[str] = None   # 'mapping' | 'navigation' | None
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        self._initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
         if image_compressed:
@@ -878,17 +884,53 @@ class WebControlNode(Node):
             return False, 'no saved map — run mapping and Save Map first'
         self._launch_nav('navigation', 'nav2_bringup.launch.py',
                           [f'map:={self.saved_map_yaml()}'])
+        # AMCL needs an initial pose or it never publishes map->odom (nav is then
+        # dead). Seed /initialpose a few times once AMCL has come up.
+        threading.Thread(target=self._seed_initial_pose, daemon=True).start()
         return True, f'navigation started on {self.saved_map_yaml()}'
+
+    def _seed_initial_pose(self):
+        x = float(self.get_parameter('initial_pose_x').value)
+        y = float(self.get_parameter('initial_pose_y').value)
+        yaw = float(self.get_parameter('initial_pose_yaw').value)
+        msg = PoseWithCovarianceStamped()
+        msg.header.frame_id = 'map'
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+        cov = [0.0] * 36
+        cov[0] = cov[7] = 0.25       # x, y variance
+        cov[35] = 0.0685             # yaw variance
+        msg.pose.covariance = cov
+        # Publish a few times; AMCL must be up + subscribed before it takes effect.
+        time.sleep(4.0)
+        for _ in range(5):
+            msg.header.stamp = self.get_clock().now().to_msg()
+            self._initpose_pub.publish(msg)
+            time.sleep(2.0)
+        self.get_logger().info(f'seeded AMCL initial pose ({x:.2f}, {y:.2f}, {yaw:.2f})')
 
     def stop_nav(self) -> Optional[str]:
         with self._nav_lock:
             proc, mode = self._nav_proc, self._nav_mode
             self._nav_proc, self._nav_mode = None, None
         if proc is not None and proc.poll() is None:
+            # Kill the whole launch process group and WAIT for it to die, so a
+            # following start_* gets a clean slate (otherwise the old
+            # lifecycle_manager/amcl linger and fight the new stack).
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGINT)
             except (ProcessLookupError, PermissionError):
                 pass
+            try:
+                proc.wait(timeout=8.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    proc.wait(timeout=3.0)
+                except (ProcessLookupError, PermissionError, subprocess.TimeoutExpired):
+                    pass
         return mode
 
     def save_map(self) -> tuple:
