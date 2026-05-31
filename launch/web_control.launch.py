@@ -27,6 +27,11 @@ def launch_setup(context, *args, **kwargs):
         image_topic = ('/stereo_camera/left/image_raw' if sim
                        else '/stereo_camera/left/image_raw/compressed')
 
+    # In sim the web teleop publishes to its OWN topic so it does not collide
+    # with Nav2's /cmd_vel stream; the bridge muxes the two (teleop priority).
+    # On the real robot the teleop drives /cmd_vel directly.
+    web_cmd_topic = '/cmd_vel_teleop' if sim else LaunchConfiguration('cmd_vel_topic')
+
     web_node = Node(
         package='jetank_web_control',
         executable='web_control_node',
@@ -36,7 +41,7 @@ def launch_setup(context, *args, **kwargs):
             'web_port':          LaunchConfiguration('web_port'),
             'image_topic':       image_topic,
             'image_compressed':  not sim,
-            'cmd_vel_topic':     LaunchConfiguration('cmd_vel_topic'),
+            'cmd_vel_topic':     web_cmd_topic,
             'max_linear_speed':  LaunchConfiguration('max_linear'),
             'max_angular_speed': LaunchConfiguration('max_angular'),
             'use_sim_time':      sim,
@@ -44,7 +49,7 @@ def launch_setup(context, *args, **kwargs):
         }],
     )
 
-    # In sim, bridge the web's Twist to the controller's TwistStamped topic.
+    # In sim, mux web teleop + Nav2 and bridge to the TwistStamped controller topic.
     bridge_node = Node(
         package='jetank_web_control',
         executable='cmd_vel_bridge',
@@ -52,7 +57,8 @@ def launch_setup(context, *args, **kwargs):
         output='screen',
         condition=IfCondition(LaunchConfiguration('sim')),
         parameters=[{
-            'input_topic':  LaunchConfiguration('cmd_vel_topic'),
+            'teleop_topic': '/cmd_vel_teleop',
+            'nav_topic':    LaunchConfiguration('nav_cmd_vel'),
             'output_topic': LaunchConfiguration('output_cmd_vel'),
             'use_sim_time': True,
         }],
@@ -73,5 +79,7 @@ def generate_launch_description():
                               description='Simulation mode: raw camera + cmd_vel bridge + use_sim_time'),
         DeclareLaunchArgument('output_cmd_vel', default_value='/diff_drive_controller/cmd_vel',
                               description='Bridge output (TwistStamped) topic for the sim controller'),
+        DeclareLaunchArgument('nav_cmd_vel', default_value='/cmd_vel',
+                              description='Nav2 Twist topic the bridge muxes in (teleop has priority)'),
         OpaqueFunction(function=launch_setup),
     ])
