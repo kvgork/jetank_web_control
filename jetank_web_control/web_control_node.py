@@ -162,11 +162,18 @@ _HTML = """<!DOCTYPE html>
               display:flex;flex-direction:column;gap:4px;flex-shrink:0}
   .map-title{font-size:.72rem;text-transform:uppercase;letter-spacing:1px;color:#58a6ff}
   .map-meta-txt{font-size:.65rem;color:#8b949e}
-  .map-canvas-wrap{flex:1;overflow:hidden;display:flex;align-items:center;
-                   justify-content:center;padding:4px}
+  .map-canvas-wrap{position:relative;flex:1;overflow:hidden;display:flex;
+                   align-items:center;justify-content:center;padding:4px}
   #map-img{image-rendering:pixelated;max-width:100%;max-height:100%;
            object-fit:contain;display:block;opacity:.3}
   #map-img.loaded{opacity:1}
+  #map-overlay{position:absolute;inset:0;pointer-events:none}
+  #map-loading{position:absolute;inset:0;display:none;flex-direction:column;
+               gap:10px;align-items:center;justify-content:center;
+               background:rgba(1,4,9,.66);color:#e6edf3;font-size:.78rem}
+  .spinner{width:34px;height:34px;border:3px solid #30363d;border-top-color:#58a6ff;
+           border-radius:50%;animation:spin 0.9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
   .map-footer{padding:8px 12px;background:#161b22;border-top:1px solid #30363d;
               display:flex;gap:8px;align-items:center;flex-shrink:0}
   .mbtn{padding:5px 12px;border-radius:5px;border:1px solid #30363d;
@@ -214,6 +221,11 @@ _HTML = """<!DOCTYPE html>
            onclick="mapClick(event)"
            onload="this.classList.add('loaded')"
            onerror="this.classList.remove('loaded');document.getElementById('map-meta-txt').textContent='Waiting for /map topic&#x2026;'">
+      <canvas id="map-overlay"></canvas>
+      <div id="map-loading">
+        <div class="spinner"></div>
+        <div id="map-loading-txt">Determining robot position&#x2026;</div>
+      </div>
     </div>
     <div class="map-footer">
       <button class="mbtn" id="start-map-btn" onclick="startMapping()">Start Mapping</button>
@@ -567,10 +579,68 @@ function toggleMappingMode() {
   }
 }
 
+let lastMeta = null;
+let localizing = false;
+let localizeStart = 0;
+
 function startMapRefresh() {
   refreshMap();
   refreshNavStatus();
-  mapRefreshTimer = setInterval(() => { refreshMap(); refreshNavStatus(); }, 1500);
+  refreshRobotPose();
+  mapRefreshTimer = setInterval(() => {
+    refreshMap(); refreshNavStatus(); refreshRobotPose();
+  }, 1000);
+}
+
+function refreshRobotPose() {
+  fetch('/robot_pose')
+    .then(r => r.ok ? r.json() : null)
+    .then(p => {
+      const load = document.getElementById('map-loading');
+      if (!p || !p.available) {
+        if (localizing) load.style.display = 'flex';  // still determining
+        return;
+      }
+      drawRobotArrow(p);
+      if (localizing) {
+        if (p.converged) {
+          localizing = false;
+          load.style.display = 'none';
+          navMsg('\\u2713 localized (' + p.x + ', ' + p.y + ')', true);
+        } else if (Date.now() - localizeStart > 25000) {
+          localizing = false;
+          load.style.display = 'none';
+          navMsg('localization uncertain \\u2014 drive a little or re-try', false);
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+function drawRobotArrow(p) {
+  const img = document.getElementById('map-img');
+  const cv = document.getElementById('map-overlay');
+  if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return;
+  const wrap = img.parentElement;
+  cv.width = wrap.clientWidth; cv.height = wrap.clientHeight;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  const scale = Math.min(cv.width / natW, cv.height / natH);
+  const ox = (cv.width - natW * scale) / 2;
+  const oy = (cv.height - natH * scale) / 2;
+  const col = (p.x - lastMeta.origin_x) / lastMeta.resolution;
+  const gridRow = (p.y - lastMeta.origin_y) / lastMeta.resolution;
+  const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is vertically flipped
+  const px = ox + ix * scale, py = oy + iy * scale;
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(-p.yaw);                  // image y is down => screen angle = -yaw
+  ctx.fillStyle = '#ff3b30'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(13, 0); ctx.lineTo(-8, -7); ctx.lineTo(-3, 0); ctx.lineTo(-8, 7);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.restore();
 }
 
 function stopMapRefresh() {
@@ -583,6 +653,7 @@ function refreshMap() {
     .then(r => r.ok ? r.json() : null)
     .then(meta => {
       if (!meta || !meta.width) return;
+      lastMeta = meta;
       const w = (meta.width  * meta.resolution).toFixed(1);
       const h = (meta.height * meta.resolution).toFixed(1);
       document.getElementById('map-meta-txt').textContent =
@@ -648,7 +719,19 @@ function startNavigation() {
   navMsg('Starting navigation\\u2026', true);
   fetch('/start_navigation', {method: 'POST'})
     .then(r => r.json())
-    .then(d => navMsg(d.status === 'ok' ? '\\u2713 navigation started' : (d.msg || 'error'), d.status === 'ok'))
+    .then(d => {
+      navMsg(d.status === 'ok' ? 'determining position\\u2026' : (d.msg || 'error'),
+             d.status === 'ok');
+      if (d.status === 'ok') {
+        // Show the "determining robot position" loader until AMCL converges
+        // (refreshRobotPose hides it and draws the pose arrow).
+        localizing = true;
+        localizeStart = Date.now();
+        document.getElementById('map-loading-txt').textContent =
+          'Determining robot position\\u2026';
+        document.getElementById('map-loading').style.display = 'flex';
+      }
+    })
     .catch(() => navMsg('Request failed', false))
     .finally(refreshNavStatus);
 }
@@ -749,6 +832,11 @@ class WebControlNode(Node):
         self._nav_mode: Optional[str] = None   # 'mapping' | 'navigation' | None
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self._initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        # AMCL's estimated robot pose (for the web map arrow + localization status).
+        self._amcl_lock = threading.Lock()
+        self._amcl_pose = None
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose',
+                                 self._on_amcl_pose, 10)
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
         if image_compressed:
@@ -844,6 +932,29 @@ class WebControlNode(Node):
         with self._map_lock:
             return dict(self._map_meta)
 
+    def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
+        q = msg.pose.pose.orientation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        cov = msg.pose.covariance
+        with self._amcl_lock:
+            self._amcl_pose = {
+                'x': round(float(msg.pose.pose.position.x), 4),
+                'y': round(float(msg.pose.pose.position.y), 4),
+                'yaw': round(float(yaw), 4),
+                # max of x/y position variance — small => localized/converged
+                'cov': round(float(max(cov[0], cov[7])), 4),
+            }
+
+    def get_robot_pose(self) -> dict:
+        with self._amcl_lock:
+            if self._amcl_pose is None:
+                return {'available': False}
+            p = dict(self._amcl_pose)
+        p['available'] = True
+        p['converged'] = p['cov'] < 0.5
+        return p
+
     # ---- navigation backend ----------------------------------------------
 
     def saved_map_yaml(self) -> str:
@@ -925,6 +1036,8 @@ class WebControlNode(Node):
         self.get_logger().info(f'seeded AMCL initial pose ({x:.2f}, {y:.2f}, {yaw:.2f})')
 
     def stop_nav(self) -> Optional[str]:
+        with self._amcl_lock:
+            self._amcl_pose = None    # re-determine pose on the next navigation
         with self._nav_lock:
             proc, mode = self._nav_proc, self._nav_mode
             self._nav_proc, self._nav_mode = None, None
@@ -1135,6 +1248,11 @@ async def handle_nav_status(request: web.Request) -> web.Response:
     return web.json_response(node.nav_status())
 
 
+async def handle_robot_pose(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.get_robot_pose())
+
+
 async def handle_navigate(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     try:
@@ -1164,6 +1282,7 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_post('/start_navigation', handle_start_navigation)
     app.router.add_post('/stop_nav', handle_stop_nav)
     app.router.add_get('/nav_status', handle_nav_status)
+    app.router.add_get('/robot_pose', handle_robot_pose)
     app.router.add_post('/navigate', handle_navigate)
     return app
 
