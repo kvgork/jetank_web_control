@@ -1029,13 +1029,20 @@ class WebControlNode(Node):
         cov[0] = cov[7] = 0.25       # x, y variance
         cov[35] = 0.0685             # yaw variance
         msg.pose.covariance = cov
-        # Publish a few times; AMCL must be up + subscribed before it takes effect.
-        time.sleep(4.0)
-        for _ in range(5):
+        # Keep re-publishing until AMCL actually converges near the seed. A single
+        # early publish is lost because AMCL is not subscribed yet during bringup
+        # under load; this loop guarantees one lands once AMCL is ready.
+        for _ in range(25):
             msg.header.stamp = self.get_clock().now().to_msg()
             self._initpose_pub.publish(msg)
-            time.sleep(2.0)
-        self.get_logger().info(f'seeded AMCL initial pose ({x:.2f}, {y:.2f}, {yaw:.2f})')
+            time.sleep(1.2)
+            with self._amcl_lock:
+                ap = dict(self._amcl_pose) if self._amcl_pose else None
+            if ap and abs(ap['x'] - x) < 0.5 and abs(ap['y'] - y) < 0.5:
+                self.get_logger().info(
+                    f'AMCL accepted initial pose ({x:.2f}, {y:.2f}, {yaw:.2f})')
+                return
+        self.get_logger().warn('AMCL did not converge to the seeded initial pose')
 
     def stop_nav(self) -> Optional[str]:
         with self._amcl_lock:
