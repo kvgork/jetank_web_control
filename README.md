@@ -88,29 +88,41 @@ robot in Gazebo, and the camera feed streams.
 
 ### Mapping & navigation from the browser (Nav2)
 
-In sim mode the map panel (desktop) drives the full SLAM + Nav2 stack:
+The desktop layout shows a **live map directly under the camera feed**. It drives
+the full SLAM + Nav2 stack and supports click-to-navigate:
 
 1. **Start Mapping** — launches `jetank_navigation/slam_nav2.launch.py`
-   (slam_toolbox online mapping + Nav2 navigation-only; slam supplies `/map`
-   and `map -> odom`, so no AMCL/map_server). The live map appears in the panel.
+   (slam_toolbox online mapping + Nav2 navigation-only via `navigation_only.launch.py`;
+   slam supplies `/map` and `map -> odom`, so no AMCL/map_server). Live map appears.
 2. Drive around (WASD / joystick) to build the map.
 3. **Click anywhere on the map** → sends a `NavigateToPose` goal at that point
-   (the click pixel is converted to map-frame metres using the map origin +
-   resolution). The robot plans and drives there.
-4. **Save Map** — writes a canonical `~/maps/sim_map.{yaml,pgm}`.
+   (click pixel → map-frame metres via origin + resolution). The robot drives there.
+4. **Save Map** — writes a canonical `~/maps/sim_map.{yaml,pgm}`
+   (map_saver runs with `use_sim_time`).
 5. **Navigate (saved map)** — enabled once a saved map exists; launches
-   `nav2_bringup.launch.py map:=~/maps/sim_map.yaml` (map_server + AMCL +
-   Nav2) so you can localize + navigate on the previously-made map without
-   re-mapping.
+   `nav2_bringup.launch.py map:=~/maps/sim_map.yaml` (map_server + AMCL + Nav2).
+   It first **localizes**: a "Determining robot position…" loader shows while AMCL
+   converges, then a **red pose arrow** is drawn on the map at the robot's
+   estimated position + heading (updated live).
 6. **Stop** — shuts the nav stack down.
 
 Endpoints: `POST /start_mapping`, `POST /start_navigation`, `POST /stop_nav`,
-`GET /nav_status`, `POST /navigate {x,y}` (map-image pixel).
+`GET /nav_status`, `GET /robot_pose`, `POST /navigate {x,y}` (map-image pixel).
 
-> Nav reliability depends on the world. The bundled `obstacle_course` places
-> obstacles ~0.5 m from spawn, so tightly-spaced goals may trigger Nav2 recovery
-> behaviours. Costmap `robot_radius`/`inflation_radius` were reduced for the
-> small JeTank footprint; tune further or use a sparser world for smoother runs.
+**Velocity muxing:** the web teleop publishes `/cmd_vel_teleop` and Nav2 publishes
+`/cmd_vel`; `cmd_vel_bridge` muxes them (teleop wins only while actively non-zero)
+and republishes `TwistStamped` to `/diff_drive_controller/cmd_vel`. This stops the
+teleop watchdog's idle zeros and Nav2 from fighting over one topic.
+
+**Notes / known limits:**
+- **Saved-map mode needs a map that matches the live world** and the robot to start
+  at the seeded pose (`initial_pose_*` params, default origin). AMCL is seeded via
+  `/initialpose` (re-published until it converges). If the robot starts elsewhere,
+  localization will be wrong — a "click to set pose" control is a future addition.
+- The **Start Mapping** path is the most robust for navigation (slam_toolbox gives
+  continuous localization, no AMCL init/lifecycle fragility).
+- Costmap `inflation_radius` (0.18) / `robot_radius` (0.12) are tuned for the small
+  JeTank; adjust in `jetank_navigation/config/nav2/nav2_params.yaml`.
 
 ### 4. Open the controller
 
