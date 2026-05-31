@@ -154,9 +154,10 @@ _HTML = """<!DOCTYPE html>
   }
 
   /* ---- mapping panel (desktop only) --------------------------------- */
-  .map-panel{display:none;width:320px;background:#010409;
-             border-left:1px solid #30363d;flex-direction:column;
-             overflow:hidden;flex-shrink:0}
+  .cam-col{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+  .map-panel{display:flex;background:#010409;
+             border-top:1px solid #30363d;flex-direction:column;
+             overflow:hidden;flex:0 0 44%;max-height:44%}
   .map-header{padding:10px 12px;background:#161b22;border-bottom:1px solid #30363d;
               display:flex;flex-direction:column;gap:4px;flex-shrink:0}
   .map-title{font-size:.72rem;text-transform:uppercase;letter-spacing:1px;color:#58a6ff}
@@ -193,6 +194,8 @@ _HTML = """<!DOCTYPE html>
 </header>
 
 <main>
+  <!-- left column: camera on top, live map underneath -->
+  <div class="cam-col">
   <!-- camera -->
   <div class="cam">
     <img id="cam-img" src="/stream.mjpg" alt="camera"
@@ -221,6 +224,7 @@ _HTML = """<!DOCTYPE html>
       <div class="map-hint" id="nav-hint">Start mapping (or load a saved map), then click the map to send the robot there.</div>
     </div>
   </div>
+  </div><!-- /cam-col -->
 
   <!-- desktop sidebar -->
   <div class="sidebar">
@@ -546,21 +550,20 @@ function scheduleReconnectStream() {
 let mappingMode = false;
 let mapRefreshTimer = null;
 
+// The map panel is always visible under the camera. The sidebar button now
+// just starts/stops the SLAM+Nav2 stack (the map itself refreshes on its own).
 function toggleMappingMode() {
   if (isTouch) return;
   mappingMode = !mappingMode;
-  const panel = document.getElementById('map-panel');
-  const btn   = document.getElementById('map-toggle-btn');
+  const btn = document.getElementById('map-toggle-btn');
   if (mappingMode) {
-    panel.style.display = 'flex';
     btn.classList.add('mbtn-on');
-    btn.innerHTML = '&#x1F5FA; Stop Mapping';
-    startMapRefresh();
+    btn.innerHTML = '&#x1F5FA; Stop Nav';
+    startMapping();
   } else {
-    panel.style.display = 'none';
     btn.classList.remove('mbtn-on');
-    btn.innerHTML = '&#x1F5FA; Mapping Mode';
-    stopMapRefresh();
+    btn.innerHTML = '&#x1F5FA; Start Mapping';
+    stopNav();
   }
 }
 
@@ -682,6 +685,7 @@ function mapClick(ev) {
 // Boot
 // ===========================================================================
 connect();
+if (!isTouch) startMapRefresh();   // map panel is always shown under the camera
 </script>
 </body>
 </html>
