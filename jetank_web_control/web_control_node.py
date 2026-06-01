@@ -980,7 +980,7 @@ function lblPopulateClassSelect() {
     opt.textContent = idx + ': ' + name;
     sel.appendChild(opt);
   });
-  if (prev !== '' && prev < lblClasses.length) sel.value = prev;
+  if (prev !== '' && Number(prev) < lblClasses.length) sel.value = prev;
 }
 
 function lblPopulateList() {
@@ -2009,9 +2009,11 @@ async def handle_add_class(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     try:
         body = await request.json()
-        cls_name = str(body['name'])
+        cls_name = body['name']
     except (json.JSONDecodeError, KeyError, TypeError) as exc:
         return web.json_response({'ok': False, 'error': f'bad request: {exc}'}, status=400)
+    if not isinstance(cls_name, str):
+        return web.json_response({'ok': False, 'error': 'name must be a string'}, status=400)
     ok, info = node.add_class(cls_name)
     if ok:
         return web.json_response({'ok': True, **info})
