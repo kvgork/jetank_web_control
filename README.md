@@ -130,6 +130,46 @@ for later detection-model training (no labelling/annotation is done here).
   Jetson with limited eMMC/SD, prune the directory periodically so it can't fill
   the rootfs.
 
+#### Labelling captures in the browser
+
+A **Label** button next to Capture opens a desktop-only panel that lets you
+annotate bounding boxes on any captured image and save them in **YOLO detection
+format** — ready for `yolov8 train` or any YOLO-compatible pipeline.
+
+**How to use:**
+1. Click **Label** — the panel slides in and lists all captured images (newest
+   first) with a badge showing the box count (or "n" for unlabelled).
+2. Click an image in the list to load it on the right.
+3. **Drag** on the image to draw a box; the current class from the dropdown is
+   assigned.  A plain **click** on a box selects it (highlighted in orange).
+4. Use **Delete box** to remove the selected box.
+5. Click **Save** to persist the labels.  The badge updates immediately.
+6. Add new class names with the text input + **+** button.
+
+**Label format (YOLO detection — `*.txt` sidecars):**
+
+One `.txt` file per image, same basename, stored alongside the JPEG in
+`capture_dir`.  Each line: `<cls> <cx> <cy> <w> <h>` where `cls` is an integer
+class index and `cx`, `cy`, `w`, `h` are floats normalized to [0, 1] (center +
+size, 6 decimal places).  An empty or absent sidecar means the image is
+unlabelled.
+
+**`classes.txt`** in `capture_dir` lists one class name per line; the line
+index is the class id.  It is created on first node startup (seeded from the
+`capture_classes` parameter).  Once present it is the source of truth — the
+parameter is ignored.
+
+**Endpoints:**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET`  | `/captures` | List captured images + label status; returns `{images:[{name,labelled,n_boxes},...], classes:[...]}` |
+| `GET`  | `/captures/img/{name}` | Raw JPEG bytes (`image/jpeg`) or `404 {ok:false}` |
+| `GET`  | `/captures/labels/{name}` | `{ok:true, boxes:[{cls,cx,cy,w,h},...], classes:[...]}` or `404` |
+| `POST` | `/captures/labels/{name}` | Body `{boxes:[...]}` — write YOLO sidecar; `{ok:true}` or `400 {ok:false,error}` |
+| `POST` | `/captures/classes` | Body `{name}` — append class; returns `{ok:true,classes:[...],index:n}` |
+
+
 **Velocity muxing:** the web teleop publishes `/cmd_vel_teleop` and Nav2 publishes
 `/cmd_vel`; `cmd_vel_bridge` muxes them (teleop wins only while actively non-zero)
 and republishes `TwistStamped` to `/diff_drive_controller/cmd_vel`. This stops the
@@ -191,6 +231,7 @@ Use the **Speed** slider to limit maximum velocity.
 | `cmd_timeout_sec` | `0.5` | Stop robot if no WebSocket message received for this long |
 | `image_compressed` | `true` | `true` = subscribe `CompressedImage`; `false` = raw `Image` + local JPEG encode (sim) |
 | `capture_dir` | `~/datasets/detection` | Persistent dir where `POST /capture` saves full-res JPEGs for dataset building (created if absent) |
+| `capture_classes` | `['object']` | Initial class list written to `classes.txt` when it doesn't exist yet |
 
 Launch-only args: `sim` (`false`) enables sim mode (bridge + raw image + use_sim_time);
 `output_cmd_vel` (`/diff_drive_controller/cmd_vel`) is the bridge's TwistStamped output topic.
