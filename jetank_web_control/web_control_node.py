@@ -13,6 +13,11 @@ Endpoints:
   GET  /map.png     - current Nav2 occupancy map as PNG (404 when no map yet)
   GET  /map_meta    - map metadata JSON  {"width", "height", "resolution"}
   POST /save_map    - save map via map_saver_cli to ~/maps/jetank_map_<ts>
+  GET  /captures                    - list captured images + label status
+  GET  /captures/img/{name}         - raw JPEG bytes for a capture
+  GET  /captures/labels/{name}      - YOLO label boxes for a capture
+  POST /captures/labels/{name}      - write YOLO label boxes for a capture
+  POST /captures/classes            - add a new detection class
 """
 
 import asyncio
@@ -20,6 +25,7 @@ import io
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -48,6 +54,74 @@ except ImportError:
     raise SystemExit(
         "aiohttp is required: pip install aiohttp"
     )
+
+# ---------------------------------------------------------------------------
+# Pure module-level helpers (no ROS / aiohttp deps — directly unit-testable)
+# ---------------------------------------------------------------------------
+
+_SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+\.[Jj][Pp][Gg]$')
+
+
+def _safe_capture_name(name: str) -> Optional[str]:
+    """Return *name* if it is a safe bare filename (no path separators, no ..).
+
+    Accepts filenames matching ``^[A-Za-z0-9._-]+\\.jpg$`` (case-insensitive
+    extension).  Returns ``None`` for anything else.
+    """
+    if not name or '/' in name or '\\' in name or name == '..':
+        return None
+    if '..' in name.split('.'):
+        return None
+    if not _SAFE_NAME_RE.match(name):
+        return None
+    return name
+
+
+def _yolo_parse(text: str, n_classes: int) -> list:
+    """Parse a YOLO-format sidecar text into a list of box dicts.
+
+    Each box is ``{'cls': int, 'cx': float, 'cy': float, 'w': float,
+    'h': float}``.  Malformed lines, out-of-range class indices, and
+    coords outside ``[0, 1]`` are silently skipped.  Never raises.
+    """
+    boxes = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 5:
+            continue
+        try:
+            cls = int(parts[0])
+            cx = float(parts[1])
+            cy = float(parts[2])
+            w = float(parts[3])
+            h = float(parts[4])
+        except (ValueError, TypeError):
+            continue
+        if cls not in range(n_classes):
+            continue
+        if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0
+                and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):
+            continue
+        boxes.append({'cls': cls, 'cx': cx, 'cy': cy, 'w': w, 'h': h})
+    return boxes
+
+
+def _yolo_serialize(boxes: list) -> str:
+    """Serialize a list of box dicts to YOLO-format text.
+
+    Returns an empty string for an empty list.  Each line ends with ``\\n``.
+    Coords are formatted to 6 decimal places.
+    """
+    lines = []
+    for b in boxes:
+        lines.append(
+            f"{b['cls']} {b['cx']:.6f} {b['cy']:.6f} {b['w']:.6f} {b['h']:.6f}\n"
+        )
+    return ''.join(lines)
+
 
 # ---------------------------------------------------------------------------
 # HTML/JS controller page (served inline, no separate static files needed)
@@ -182,6 +256,9 @@ _HTML = """<!DOCTYPE html>
   .mbtn:hover{background:#30363d}.mbtn:active{background:#58a6ff22}
   .mbtn:disabled{opacity:.5;cursor:default}
   .map-save-sts{font-size:.65rem;flex:1}
+  .capture-bar{display:flex;align-items:center;gap:8px;padding:6px 8px;
+        background:#161b22;border-top:1px solid #30363d}
+  .capture-sts{font-size:.7rem;color:#8b949e;font-family:monospace}
   /* mapping toggle at bottom of sidebar */
   .sidebar-footer{margin-top:auto;padding-top:10px;border-top:1px solid #30363d}
   /* never show map panel on touch */
@@ -190,6 +267,43 @@ _HTML = """<!DOCTYPE html>
   /* mapping-mode toggle button states */
   .mbtn-on{background:#238636;border-color:#2ea043;color:#fff}
   .mbtn-on:hover{background:#2ea043}
+
+  /* ---- label panel (desktop only) ----------------------------------- */
+  .label-panel{display:none;position:fixed;top:0;right:0;bottom:0;
+               width:min(820px,90vw);background:#161b22;
+               border-left:1px solid #30363d;z-index:100;
+               flex-direction:column;overflow:hidden}
+  .label-panel.open{display:flex}
+  /* never show label panel on touch */
+  body.is-touch .label-panel{display:none!important}
+  .lbl-header{padding:10px 14px;background:#0d1117;border-bottom:1px solid #30363d;
+              display:flex;align-items:center;gap:8px;flex-shrink:0}
+  .lbl-title{font-size:.78rem;text-transform:uppercase;letter-spacing:1px;color:#58a6ff;flex:1}
+  .lbl-body{display:flex;flex:1;overflow:hidden;min-height:0}
+  .lbl-list{width:190px;flex-shrink:0;overflow-y:auto;border-right:1px solid #30363d;
+            padding:4px 0;background:#0d1117}
+  .lbl-row{padding:5px 10px;font-size:.7rem;cursor:pointer;color:#c9d1d9;
+           display:flex;justify-content:space-between;align-items:center;gap:6px;
+           border-left:2px solid transparent}
+  .lbl-row:hover{background:#21262d}
+  .lbl-row.active{background:#21262d;border-left-color:#58a6ff;color:#e0e0e0}
+  .lbl-badge{font-size:.65rem;padding:1px 5px;border-radius:8px;
+             background:#21262d;color:#8b949e;white-space:nowrap;flex-shrink:0}
+  .lbl-badge.labelled{background:#238636;color:#fff}
+  .lbl-canvas-wrap{flex:1;position:relative;overflow:hidden;display:flex;
+                   align-items:center;justify-content:center;background:#010409}
+  #lbl-img{max-width:100%;max-height:100%;object-fit:contain;display:block;
+           user-select:none;-webkit-user-drag:none}
+  #lbl-overlay{position:absolute;top:0;left:0;width:100%;height:100%;cursor:crosshair}
+  .lbl-footer{padding:8px 10px;background:#0d1117;border-top:1px solid #30363d;
+              display:flex;flex-wrap:wrap;gap:6px;align-items:center;flex-shrink:0}
+  .lbl-footer select{background:#21262d;color:#c9d1d9;border:1px solid #30363d;
+                     border-radius:4px;padding:3px 6px;font-size:.72rem;font-family:monospace}
+  .lbl-footer input[type=text]{background:#21262d;color:#c9d1d9;border:1px solid #30363d;
+                               border-radius:4px;padding:3px 6px;font-size:.72rem;
+                               font-family:monospace;width:110px}
+  #lbl-sts{font-size:.68rem;flex:1;text-align:right}
+  .lbl-hint{font-size:.65rem;color:#8b949e;width:100%;padding-top:2px}
 </style>
 </head>
 <body>
@@ -208,6 +322,13 @@ _HTML = """<!DOCTYPE html>
     <img id="cam-img" src="/stream.mjpg" alt="camera"
          onerror="scheduleReconnectStream()" onload="onImgLoad()">
     <div class="cam-overlay">left camera</div>
+  </div>
+
+  <!-- capture bar: save the current frame to the robot for dataset building -->
+  <div class="capture-bar">
+    <button class="mbtn" id="capture-btn" onclick="capture()">&#x1F4F7; Capture</button>
+    <button class="mbtn" id="label-btn" onclick="openLabeler()">&#x1F3F7; Label</button>
+    <span class="capture-sts" id="capture-sts">0 saved</span>
   </div>
 
   <!-- mapping panel: desktop only, shown when mapping mode is active -->
@@ -311,6 +432,30 @@ _HTML = """<!DOCTYPE html>
   </div>
 </main>
 
+<!-- label panel (desktop only, toggled by openLabeler()) -->
+<div class="label-panel" id="label-panel">
+  <div class="lbl-header">
+    <span class="lbl-title">&#x1F3F7; Label captures</span>
+    <button class="mbtn" onclick="closeLabeler()">&#x2715; Close</button>
+  </div>
+  <div class="lbl-body">
+    <div class="lbl-list" id="lbl-list"></div>
+    <div class="lbl-canvas-wrap">
+      <img id="lbl-img" src="" alt="">
+      <canvas id="lbl-overlay"></canvas>
+    </div>
+  </div>
+  <div class="lbl-footer">
+    <select id="lbl-class"></select>
+    <input type="text" id="lbl-newclass" placeholder="new class">
+    <button class="mbtn" onclick="lblAddClass()">+</button>
+    <button class="mbtn" onclick="lblSaveLabels()">Save</button>
+    <button class="mbtn" onclick="lblDeleteBox()">Delete box</button>
+    <span id="lbl-sts"></span>
+    <div class="lbl-hint">Drag on the image to draw a box; click a box to select it.</div>
+  </div>
+</div>
+
 <script>
 // ===========================================================================
 // State
@@ -329,9 +474,9 @@ function detectInputMode() {
   isTouch = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
   if (isTouch) {
     document.body.classList.add('is-touch');
-    document.getElementById('ctrl-mode').textContent = '&#x1F4F1; Touch mode';
+    document.getElementById('ctrl-mode').textContent = '\\u1F4F1 Touch mode';
   } else {
-    document.getElementById('ctrl-mode').textContent = '&#x1F5A5; Desktop mode';
+    document.getElementById('ctrl-mode').textContent = '\\u1F5A5 Desktop mode';
   }
 }
 detectInputMode();
@@ -697,6 +842,25 @@ function navMsg(text, ok) {
   sts.textContent = text;
 }
 
+function capture() {
+  const btn = document.getElementById('capture-btn');
+  const sts = document.getElementById('capture-sts');
+  btn.disabled = true;
+  fetch('/capture', {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        sts.style.color = '#3fb950';
+        sts.textContent = d.count + ' saved \\u00B7 ' + d.filename;
+      } else {
+        sts.style.color = '#f85149';
+        sts.textContent = d.error || 'capture failed';
+      }
+    })
+    .catch(() => { sts.style.color = '#f85149'; sts.textContent = 'request failed'; })
+    .finally(() => { btn.disabled = false; });
+}
+
 function refreshNavStatus() {
   fetch('/nav_status')
     .then(r => r.ok ? r.json() : null)
@@ -771,6 +935,304 @@ function mapClick(ev) {
 }
 
 // ===========================================================================
+// Labeller
+// ===========================================================================
+let lblImages = [];
+let lblClasses = [];
+let lblCurrent = null;
+let lblBoxes = [];
+let lblSel = -1;
+
+// Drag state
+let lblDragging = false;
+let lblDragStartNx = 0, lblDragStartNy = 0;
+let lblDragCurNx = 0, lblDragCurNy = 0;
+const LBL_MIN_PX = 5;  // ignore box smaller than this many canvas pixels
+
+function openLabeler() {
+  if (isTouch) return;
+  fetch('/captures')
+    .then(r => r.json())
+    .then(d => {
+      lblImages = d.images || [];
+      lblClasses = d.classes || [];
+      lblPopulateClassSelect();
+      lblPopulateList();
+      document.getElementById('label-panel').classList.add('open');
+      if (lblImages.length === 0) {
+        document.getElementById('lbl-list').textContent = 'No captures yet.';
+      }
+    })
+    .catch(() => {});
+}
+
+function closeLabeler() {
+  document.getElementById('label-panel').classList.remove('open');
+}
+
+function lblPopulateClassSelect() {
+  const sel = document.getElementById('lbl-class');
+  const prev = sel.value;
+  sel.innerHTML = '';
+  lblClasses.forEach((name, idx) => {
+    const opt = document.createElement('option');
+    opt.value = idx;
+    opt.textContent = idx + ': ' + name;
+    sel.appendChild(opt);
+  });
+  if (prev !== '' && Number(prev) < lblClasses.length) sel.value = prev;
+}
+
+function lblPopulateList() {
+  const list = document.getElementById('lbl-list');
+  list.innerHTML = '';
+  lblImages.forEach(img => {
+    const row = document.createElement('div');
+    row.className = 'lbl-row' + (img.name === lblCurrent ? ' active' : '');
+    row.dataset.name = img.name;
+    row.onclick = () => lblSelectImage(img.name);
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = img.name;
+    nameSpan.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0';
+    const badge = document.createElement('span');
+    badge.className = 'lbl-badge' + (img.labelled ? ' labelled' : '');
+    badge.textContent = img.labelled ? ('\\u2713 ' + img.n_boxes) : 'n';
+    badge.dataset.name = img.name;
+    row.appendChild(nameSpan);
+    row.appendChild(badge);
+    list.appendChild(row);
+  });
+}
+
+function lblUpdateBadge(name, boxes) {
+  const badge = document.querySelector('.lbl-badge[data-name="' + CSS.escape(name) + '"]');
+  if (!badge) return;
+  if (boxes.length > 0) {
+    badge.className = 'lbl-badge labelled';
+    badge.textContent = '\\u2713 ' + boxes.length;
+  } else {
+    badge.className = 'lbl-badge';
+    badge.textContent = 'n';
+  }
+}
+
+function lblSelectImage(name) {
+  lblCurrent = name;
+  lblBoxes = [];
+  lblSel = -1;
+  // Highlight active row
+  document.querySelectorAll('.lbl-row').forEach(r => {
+    r.classList.toggle('active', r.dataset.name === name);
+  });
+  fetch('/captures/labels/' + encodeURIComponent(name))
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        lblBoxes = d.boxes || [];
+        if (d.classes && d.classes.length) {
+          lblClasses = d.classes;
+          lblPopulateClassSelect();
+        }
+      }
+      const img = document.getElementById('lbl-img');
+      img.onload = () => lblRedraw();
+      img.src = '/captures/img/' + encodeURIComponent(name) + '?t=' + Date.now();
+    })
+    .catch(() => {});
+}
+
+// Convert normalized [0,1] coords to canvas pixel coords using content-rect math.
+function lblNormToCanvas(nx, ny) {
+  const img = document.getElementById('lbl-img');
+  const cv = document.getElementById('lbl-overlay');
+  if (!img.naturalWidth) return [0, 0];
+  const er = img.getBoundingClientRect();
+  const cr = cv.getBoundingClientRect();
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  const scale = Math.min(er.width / natW, er.height / natH);
+  const cw = natW * scale, ch = natH * scale;
+  const contentLeft = er.left + (er.width - cw) / 2;
+  const contentTop  = er.top  + (er.height - ch) / 2;
+  const px = (contentLeft - cr.left) + nx * cw;
+  const py = (contentTop  - cr.top)  + ny * ch;
+  return [px, py];
+}
+
+// Convert canvas pixel coords to normalized [0,1] (clamped).
+function lblCanvasToNorm(px, py) {
+  const img = document.getElementById('lbl-img');
+  const cv = document.getElementById('lbl-overlay');
+  if (!img.naturalWidth) return [0, 0];
+  const er = img.getBoundingClientRect();
+  const cr = cv.getBoundingClientRect();
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  const scale = Math.min(er.width / natW, er.height / natH);
+  const cw = natW * scale, ch = natH * scale;
+  const contentLeft = er.left + (er.width - cw) / 2;
+  const contentTop  = er.top  + (er.height - ch) / 2;
+  const nx = (px - (contentLeft - cr.left)) / cw;
+  const ny = (py - (contentTop  - cr.top))  / ch;
+  return [Math.max(0, Math.min(1, nx)), Math.max(0, Math.min(1, ny))];
+}
+
+function lblRedraw(inProgressBox) {
+  const cv = document.getElementById('lbl-overlay');
+  cv.width = cv.clientWidth;
+  cv.height = cv.clientHeight;
+  if (!cv.width || !cv.height) return;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);
+
+  // Draw committed boxes
+  lblBoxes.forEach((b, idx) => {
+    const [x1, y1] = lblNormToCanvas(b.cx - b.w / 2, b.cy - b.h / 2);
+    const [x2, y2] = lblNormToCanvas(b.cx + b.w / 2, b.cy + b.h / 2);
+    const sel = idx === lblSel;
+    ctx.strokeStyle = sel ? '#ff9500' : '#58a6ff';
+    ctx.lineWidth = sel ? 2.5 : 1.5;
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    const label = (lblClasses[b.cls] || ('cls' + b.cls));
+    ctx.fillStyle = sel ? '#ff9500' : '#58a6ff';
+    ctx.font = '11px monospace';
+    ctx.fillText(label, x1 + 2, y1 - 3 > 0 ? y1 - 3 : y1 + 12);
+  });
+
+  // Draw in-progress rubber-band box
+  if (inProgressBox) {
+    const [ix1, iy1] = lblNormToCanvas(inProgressBox.x0, inProgressBox.y0);
+    const [ix2, iy2] = lblNormToCanvas(inProgressBox.x1, inProgressBox.y1);
+    ctx.strokeStyle = '#3fb950';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(ix1, iy1, ix2 - ix1, iy2 - iy1);
+    ctx.setLineDash([]);
+  }
+}
+
+// Mouse handlers on lbl-overlay
+(function() {
+  const cv = document.getElementById('lbl-overlay');
+  let dragThreshold = false;  // becomes true once we've dragged LBL_MIN_PX
+
+  cv.addEventListener('mousedown', e => {
+    if (!lblCurrent) return;
+    const r = cv.getBoundingClientRect();
+    const [nx, ny] = lblCanvasToNorm(e.clientX - r.left, e.clientY - r.top);
+    lblDragStartNx = nx; lblDragStartNy = ny;
+    lblDragCurNx = nx;   lblDragCurNy = ny;
+    lblDragging = true;
+    dragThreshold = false;
+  });
+
+  document.addEventListener('mousemove', e => {
+    if (!lblDragging) return;
+    const cv2 = document.getElementById('lbl-overlay');
+    const r = cv2.getBoundingClientRect();
+    const [nx, ny] = lblCanvasToNorm(e.clientX - r.left, e.clientY - r.top);
+    lblDragCurNx = nx; lblDragCurNy = ny;
+    // Check pixel distance to detect real drag vs. click
+    const [sx, sy] = lblNormToCanvas(lblDragStartNx, lblDragStartNy);
+    const [ex, ey] = lblNormToCanvas(nx, ny);
+    if (Math.hypot(ex - sx, ey - sy) > LBL_MIN_PX) dragThreshold = true;
+    if (dragThreshold) {
+      lblRedraw({x0: lblDragStartNx, y0: lblDragStartNy, x1: nx, y1: ny});
+    }
+  });
+
+  document.addEventListener('mouseup', e => {
+    if (!lblDragging) return;
+    lblDragging = false;
+    const cv2 = document.getElementById('lbl-overlay');
+    const r = cv2.getBoundingClientRect();
+    const [nx, ny] = lblCanvasToNorm(e.clientX - r.left, e.clientY - r.top);
+
+    if (dragThreshold) {
+      // Commit new box
+      const x0 = Math.min(lblDragStartNx, nx);
+      const x1 = Math.max(lblDragStartNx, nx);
+      const y0 = Math.min(lblDragStartNy, ny);
+      const y1 = Math.max(lblDragStartNy, ny);
+      const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+      const w  = x1 - x0, h = y1 - y0;
+      const clsIdx = parseInt(document.getElementById('lbl-class').value) || 0;
+      lblBoxes.push({cls: clsIdx, cx, cy, w, h});
+      lblSel = lblBoxes.length - 1;
+    } else {
+      // Plain click: select topmost box containing the point, or deselect
+      let hit = -1;
+      for (let i = lblBoxes.length - 1; i >= 0; i--) {
+        const b = lblBoxes[i];
+        if (nx >= b.cx - b.w/2 && nx <= b.cx + b.w/2 &&
+            ny >= b.cy - b.h/2 && ny <= b.cy + b.h/2) {
+          hit = i; break;
+        }
+      }
+      lblSel = (hit === lblSel) ? -1 : hit;
+    }
+    lblRedraw();
+  });
+})();
+
+function lblDeleteBox() {
+  if (lblSel < 0 || lblSel >= lblBoxes.length) return;
+  lblBoxes.splice(lblSel, 1);
+  lblSel = -1;
+  lblRedraw();
+}
+
+function lblSaveLabels() {
+  if (!lblCurrent) return;
+  const sts = document.getElementById('lbl-sts');
+  sts.style.color = '#8b949e';
+  sts.textContent = 'Saving\\u2026';
+  fetch('/captures/labels/' + encodeURIComponent(lblCurrent), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({boxes: lblBoxes}),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        sts.style.color = '#3fb950';
+        sts.textContent = '\\u2713 saved';
+        lblUpdateBadge(lblCurrent, lblBoxes);
+      } else {
+        sts.style.color = '#f85149';
+        sts.textContent = d.error || 'save failed';
+      }
+    })
+    .catch(() => { sts.style.color = '#f85149'; sts.textContent = 'request failed'; });
+}
+
+function lblAddClass() {
+  const inp = document.getElementById('lbl-newclass');
+  const name = inp.value.trim();
+  if (!name) return;
+  fetch('/captures/classes', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name}),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        lblClasses = d.classes;
+        lblPopulateClassSelect();
+        document.getElementById('lbl-class').value = d.index;
+        inp.value = '';
+      } else {
+        const sts = document.getElementById('lbl-sts');
+        sts.style.color = '#f85149';
+        sts.textContent = d.error || 'add class failed';
+      }
+    })
+    .catch(() => {});
+}
+
+// Redraw on window resize (boxes stay in normalized coords)
+window.addEventListener('resize', () => { if (lblCurrent) lblRedraw(); });
+
+// ===========================================================================
 // Boot
 // ===========================================================================
 connect();
@@ -809,6 +1271,10 @@ class WebControlNode(Node):
         self.declare_parameter('initial_pose_x', 0.0)
         self.declare_parameter('initial_pose_y', 0.0)
         self.declare_parameter('initial_pose_yaw', 0.0)
+        # Persistent dir on the robot for captured training images (NOT /tmp).
+        self.declare_parameter('capture_dir', os.path.expanduser('~/datasets/detection'))
+        # Default class names written to classes.txt if it doesn't exist yet.
+        self.declare_parameter('capture_classes', ['object'])
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -823,6 +1289,27 @@ class WebControlNode(Node):
 
         self._frame_lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
+
+        # Image capture (persistent, for detection-model training datasets).
+        self._capture_dir = os.path.expanduser(
+            self.get_parameter('capture_dir').value)
+        os.makedirs(self._capture_dir, exist_ok=True)
+        self._capture_lock = threading.Lock()
+        self._capture_seq = 0
+        # Seed the saved-count once so each capture doesn't re-scan the dir
+        # (it is expected to grow large). Counter is maintained in memory after.
+        try:
+            self._capture_count = sum(
+                1 for n in os.listdir(self._capture_dir)
+                if n.lower().endswith('.jpg'))
+        except OSError:
+            self._capture_count = 0
+
+        # YOLO class list — loaded/created in _load_or_init_classes().
+        self._classes_path = os.path.join(self._capture_dir, 'classes.txt')
+        self._classes_lock = threading.Lock()
+        self._classes: list = []
+        self._load_or_init_classes()
 
         self._cmd_lock = threading.Lock()
         self._last_cmd_time = 0.0
@@ -858,6 +1345,35 @@ class WebControlNode(Node):
             f'Web control: http://<jetson-ip>:{self._port}  '
             f'| camera: {image_topic}  | cmd_vel: {cmd_topic}'
         )
+
+    # ---- classes.txt helpers ---------------------------------------------
+
+    def _load_or_init_classes(self) -> None:
+        """Load classes.txt if present; otherwise seed from the param and write it."""
+        if os.path.isfile(self._classes_path):
+            try:
+                with open(self._classes_path, 'r', encoding='utf-8') as f:
+                    lines = [l.strip() for l in f if l.strip()]
+                self._classes = lines
+                return
+            except OSError:
+                pass
+        # Seed from param
+        param_val = self.get_parameter('capture_classes').value
+        self._classes = list(param_val) if param_val else ['object']
+        self._write_classes_file()
+
+    def _write_classes_file(self) -> None:
+        """Persist self._classes to classes.txt (caller must hold _classes_lock or be in __init__)."""
+        try:
+            with open(self._classes_path, 'w', encoding='utf-8') as f:
+                for name in self._classes:
+                    f.write(name + '\n')
+        except OSError as exc:
+            try:
+                self.get_logger().warn(f'Could not write classes.txt: {exc}')
+            except Exception:
+                pass
 
     # ---- callbacks --------------------------------------------------------
 
@@ -929,6 +1445,169 @@ class WebControlNode(Node):
     def get_frame(self) -> Optional[bytes]:
         with self._frame_lock:
             return self._latest_jpeg
+
+    def save_capture(self):
+        """Persist the current full-res frame as a JPEG in capture_dir.
+
+        Reuses the streamed frame (already JPEG: passthrough on the robot's
+        CompressedImage path, re-encoded on the sim raw-Image path), so no
+        decode/re-encode is needed here. Returns (ok, info|error_str).
+        """
+        frame = self.get_frame()
+        if frame is None:
+            return False, 'no camera frame available yet'
+        with self._capture_lock:
+            # Timestamp-only flat filename; seq disambiguates same-second bursts.
+            # Exclusive-create ('xb') guarantees we never overwrite an existing
+            # file even across process restarts (where _capture_seq resets to 0):
+            # on collision we bump the seq and retry rather than truncate data.
+            ts = time.strftime('%Y%m%dT%H%M%S')
+            for _ in range(100000):
+                self._capture_seq += 1
+                fname = f'{ts}_{self._capture_seq:04d}.jpg'
+                path = os.path.join(self._capture_dir, fname)
+                try:
+                    with open(path, 'xb') as f:
+                        f.write(frame)
+                    break
+                except FileExistsError:
+                    continue
+                except OSError as e:
+                    return False, f'write failed: {e}'
+            else:
+                return False, 'could not allocate a unique capture filename'
+            self._capture_count += 1
+            count = self._capture_count
+        self.get_logger().info(
+            f'captured {fname} ({len(frame)} bytes) -> {self._capture_dir}')
+        return True, {'filename': fname, 'count': count, 'dir': self._capture_dir}
+
+    # ---- label / capture listing API ------------------------------------
+
+    def list_captures(self) -> dict:
+        """List *.jpg files in capture_dir (newest first) with label status."""
+        try:
+            names = sorted(
+                [n for n in os.listdir(self._capture_dir) if n.lower().endswith('.jpg')],
+                reverse=True,
+            )
+        except OSError:
+            names = []
+        with self._classes_lock:
+            n_classes = len(self._classes)
+            classes = list(self._classes)
+        images = []
+        for name in names:
+            txt_path = os.path.join(
+                self._capture_dir, os.path.splitext(name)[0] + '.txt')
+            try:
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    txt = f.read()
+            except OSError:
+                txt = ''
+            boxes = _yolo_parse(txt, n_classes)
+            images.append({
+                'name': name,
+                'labelled': bool(txt.strip()),
+                'n_boxes': len(boxes),
+            })
+        return {'images': images, 'classes': classes}
+
+    def read_capture_image(self, name: str) -> Optional[bytes]:
+        """Return raw JPEG bytes for *name*, or None if invalid/missing."""
+        safe = _safe_capture_name(name)
+        if safe is None:
+            return None
+        path = os.path.join(self._capture_dir, safe)
+        try:
+            with open(path, 'rb') as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def read_labels(self, name: str) -> Optional[list]:
+        """Return parsed boxes for *name*, or None if the .jpg doesn't exist."""
+        safe = _safe_capture_name(name)
+        if safe is None:
+            return None
+        jpg_path = os.path.join(self._capture_dir, safe)
+        if not os.path.isfile(jpg_path):
+            return None
+        txt_path = os.path.join(
+            self._capture_dir, os.path.splitext(safe)[0] + '.txt')
+        try:
+            with open(txt_path, 'r', encoding='utf-8') as f:
+                txt = f.read()
+        except OSError:
+            txt = ''
+        with self._classes_lock:
+            n_classes = len(self._classes)
+        return _yolo_parse(txt, n_classes)
+
+    def write_labels(self, name: str, boxes: list) -> tuple:
+        """Validate and write a YOLO sidecar for *name*.
+
+        *boxes* must be a list of dicts with keys ``cls`` (int, in class range)
+        and ``cx``, ``cy``, ``w``, ``h`` (float, in [0, 1]).
+        Returns ``(True, 'ok')`` or ``(False, reason_str)``.
+        """
+        safe = _safe_capture_name(name)
+        if safe is None:
+            return False, 'invalid filename'
+        jpg_path = os.path.join(self._capture_dir, safe)
+        if not os.path.isfile(jpg_path):
+            return False, 'image not found'
+        if not isinstance(boxes, list):
+            return False, 'boxes must be a list'
+        with self._classes_lock:
+            n_classes = len(self._classes)
+        validated = []
+        for i, b in enumerate(boxes):
+            if not isinstance(b, dict):
+                return False, f'box {i} is not a dict'
+            try:
+                cls = int(b['cls'])
+                cx = float(b['cx'])
+                cy = float(b['cy'])
+                w = float(b['w'])
+                h = float(b['h'])
+            except (KeyError, TypeError, ValueError) as exc:
+                return False, f'box {i} missing/invalid field: {exc}'
+            if cls not in range(n_classes):
+                return False, f'box {i}: cls {cls} out of range(0, {n_classes})'
+            if not (0.0 <= cx <= 1.0 and 0.0 <= cy <= 1.0
+                    and 0.0 <= w <= 1.0 and 0.0 <= h <= 1.0):
+                return False, f'box {i}: coords outside [0, 1]'
+            validated.append({'cls': cls, 'cx': cx, 'cy': cy, 'w': w, 'h': h})
+        txt_path = os.path.join(
+            self._capture_dir, os.path.splitext(safe)[0] + '.txt')
+        try:
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(_yolo_serialize(validated))
+        except OSError as exc:
+            return False, f'write failed: {exc}'
+        return True, 'ok'
+
+    def add_class(self, name: str) -> tuple:
+        """Add a new detection class (thread-safe).
+
+        Returns ``(True, {'classes': list, 'index': int})`` or
+        ``(False, reason_str)``.
+        """
+        name = name.strip() if name else ''
+        if not name:
+            return False, 'class name must not be empty'
+        if '\n' in name or '\r' in name:
+            return False, 'class name must not contain newlines'
+        with self._classes_lock:
+            if name in self._classes:
+                return True, {'classes': list(self._classes),
+                               'index': self._classes.index(name)}
+            self._classes.append(name)
+            idx = len(self._classes) - 1
+            classes_copy = list(self._classes)
+            self._write_classes_file()
+        return True, {'classes': classes_copy, 'index': idx}
 
     def get_map_png(self) -> Optional[bytes]:
         with self._map_lock:
@@ -1278,6 +1957,69 @@ async def handle_navigate(request: web.Request) -> web.Response:
     return web.json_response({'status': 'error', 'msg': info}, status=409)
 
 
+async def handle_capture(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, info = node.save_capture()
+    if ok:
+        return web.json_response({'ok': True, **info})
+    return web.json_response({'ok': False, 'error': info}, status=503)
+
+
+async def handle_list_captures(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.list_captures())
+
+
+async def handle_capture_img(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    name = request.match_info['name']
+    data = node.read_capture_image(name)
+    if data is None:
+        return web.json_response({'ok': False, 'error': 'not found'}, status=404)
+    return web.Response(body=data, content_type='image/jpeg',
+                        headers={'Cache-Control': 'no-cache, no-store'})
+
+
+async def handle_get_labels(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    name = request.match_info['name']
+    boxes = node.read_labels(name)
+    if boxes is None:
+        return web.json_response({'ok': False, 'error': 'image not found'}, status=404)
+    with node._classes_lock:
+        classes = list(node._classes)
+    return web.json_response({'ok': True, 'boxes': boxes, 'classes': classes})
+
+
+async def handle_post_labels(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    name = request.match_info['name']
+    try:
+        body = await request.json()
+        boxes = body['boxes']
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return web.json_response({'ok': False, 'error': f'bad request: {exc}'}, status=400)
+    ok, info = node.write_labels(name, boxes)
+    if ok:
+        return web.json_response({'ok': True})
+    return web.json_response({'ok': False, 'error': info}, status=400)
+
+
+async def handle_add_class(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    try:
+        body = await request.json()
+        cls_name = body['name']
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        return web.json_response({'ok': False, 'error': f'bad request: {exc}'}, status=400)
+    if not isinstance(cls_name, str):
+        return web.json_response({'ok': False, 'error': 'name must be a string'}, status=400)
+    ok, info = node.add_class(cls_name)
+    if ok:
+        return web.json_response({'ok': True, **info})
+    return web.json_response({'ok': False, 'error': info}, status=400)
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -1297,6 +2039,13 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/nav_status', handle_nav_status)
     app.router.add_get('/robot_pose', handle_robot_pose)
     app.router.add_post('/navigate', handle_navigate)
+    app.router.add_post('/capture', handle_capture)
+    # Label / capture endpoints
+    app.router.add_get('/captures', handle_list_captures)
+    app.router.add_get('/captures/img/{name}', handle_capture_img)
+    app.router.add_get('/captures/labels/{name}', handle_get_labels)
+    app.router.add_post('/captures/labels/{name}', handle_post_labels)
+    app.router.add_post('/captures/classes', handle_add_class)
     return app
 
 
