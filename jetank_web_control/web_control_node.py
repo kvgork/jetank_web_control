@@ -17,6 +17,7 @@ Endpoints:
   GET  /captures/img/{name}         - raw JPEG bytes for a capture
   GET  /captures/labels/{name}      - YOLO label boxes for a capture
   POST /captures/labels/{name}      - write YOLO label boxes for a capture
+  POST /captures/autolabel/{name}   - propose rough boxes via CV colour-blob
   POST /captures/classes            - add a new detection class
 """
 
@@ -121,6 +122,63 @@ def _yolo_serialize(boxes: list) -> str:
             f"{b['cls']} {b['cx']:.6f} {b['cy']:.6f} {b['w']:.6f} {b['h']:.6f}\n"
         )
     return ''.join(lines)
+
+
+def rough_boxes_from_bgr(img, sat_min=70, val_min=40, min_area_frac=0.0006,
+                         max_area_frac=0.20, max_boxes=20) -> list:
+    """Propose rough bounding boxes from a BGR image via colour-blob detection.
+
+    Intended for *rough* auto-annotation of brightly coloured objects (e.g. the
+    sim socks) lying on a plain, low-saturation floor: it thresholds the HSV
+    saturation/value channels, cleans the mask with morphology, and returns one
+    box per surviving contour. Output is a list of YOLO-style boxes
+    ``{'cx', 'cy', 'w', 'h'}`` normalised to ``[0, 1]`` (largest first); class
+    assignment is left to the caller. Heuristic only — boxes need human review,
+    and it will miss low-saturation objects (e.g. a white sock). Never raises.
+
+    ``cv2`` is imported lazily so the module stays importable without it.
+    """
+    if not _PIL_AVAILABLE:  # numpy shares the same guarded import block
+        return []
+    try:
+        import cv2
+    except ImportError:
+        return []
+    if img is None or getattr(img, 'size', 0) == 0:
+        return []
+    h, w = img.shape[:2]
+    if h == 0 or w == 0:
+        return []
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    mask = ((sat >= sat_min) & (val >= val_min)).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # findContours returns (contours, hierarchy) on cv2>=4 and
+    # (image, contours, hierarchy) on cv2 3.x — take the second-to-last item.
+    found = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = found[-2]
+    img_area = float(w * h)
+    boxes = []
+    for contour in contours:
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        frac = (bw * bh) / img_area
+        if frac < min_area_frac or frac > max_area_frac:
+            continue
+        boxes.append({
+            'cx': (bx + bw / 2.0) / w,
+            'cy': (by + bh / 2.0) / h,
+            'w': bw / float(w),
+            'h': bh / float(h),
+            '_frac': frac,
+        })
+    boxes.sort(key=lambda b: b['_frac'], reverse=True)
+    boxes = boxes[:max_boxes]
+    for box in boxes:
+        del box['_frac']
+    return boxes
 
 
 # ---------------------------------------------------------------------------
@@ -304,11 +362,25 @@ _HTML = """<!DOCTYPE html>
                                font-family:monospace;width:110px}
   #lbl-sts{font-size:.68rem;flex:1;text-align:right}
   .lbl-hint{font-size:.65rem;color:#8b949e;width:100%;padding-top:2px}
+  .lbl-auto-lbl{font-size:.72rem;color:#c9d1d9;display:flex;align-items:center;
+                gap:4px;cursor:pointer;user-select:none}
+  /* ---- header tabs (desktop only) ----------------------------------- */
+  .tabs{display:flex;gap:4px;margin-left:12px}
+  .tab{background:#21262d;border:1px solid #30363d;border-radius:6px 6px 0 0;
+       color:#8b949e;font-family:monospace;font-size:.72rem;padding:4px 12px;
+       cursor:pointer}
+  .tab:hover{color:#c9d1d9}
+  .tab.active{background:#0d1117;color:#58a6ff;border-bottom-color:#0d1117}
+  body.is-touch .tabs{display:none}   /* annotation is desktop-only */
 </style>
 </head>
 <body>
 <header>
   <h1>&#x1F916; JeTank</h1>
+  <nav class="tabs">
+    <button class="tab active" id="tab-drive" onclick="showTab('drive')">Drive</button>
+    <button class="tab" id="tab-annot" onclick="showTab('annotate')">&#x1F3F7; Annotate</button>
+  </nav>
   <span id="ws-label" class="badge dot-err">&#x25CF; Disconnected</span>
   <span id="cam-label" class="badge" style="color:#8b949e">&#x25CF; Camera</span>
   <span id="ctrl-mode"></span>
@@ -451,8 +523,11 @@ _HTML = """<!DOCTYPE html>
     <button class="mbtn" onclick="lblAddClass()">+</button>
     <button class="mbtn" onclick="lblSaveLabels()">Save</button>
     <button class="mbtn" onclick="lblDeleteBox()">Delete box</button>
+    <button class="mbtn" onclick="lblAutoDetect()">&#x2728; Auto-detect</button>
+    <label class="lbl-auto-lbl"><input type="checkbox" id="lbl-auto"> Auto (rough)</label>
     <span id="lbl-sts"></span>
-    <div class="lbl-hint">Drag on the image to draw a box; click a box to select it.</div>
+    <div class="lbl-hint">Drag on the image to draw a box; click a box to select it.
+      &#x2728; Auto proposes rough boxes (review &amp; save); the toggle auto-runs on unlabelled images.</div>
   </div>
 </div>
 
@@ -968,6 +1043,22 @@ function openLabeler() {
 
 function closeLabeler() {
   document.getElementById('label-panel').classList.remove('open');
+  const td = document.getElementById('tab-drive');
+  const ta = document.getElementById('tab-annot');
+  if (td && ta) { td.classList.add('active'); ta.classList.remove('active'); }
+}
+
+// Header tab switching: Drive (live control) vs Annotate (labeller panel).
+function showTab(which) {
+  const td = document.getElementById('tab-drive');
+  const ta = document.getElementById('tab-annot');
+  if (which === 'annotate') {
+    td.classList.remove('active'); ta.classList.add('active');
+    openLabeler();
+  } else {
+    td.classList.add('active'); ta.classList.remove('active');
+    document.getElementById('label-panel').classList.remove('open');
+  }
 }
 
 function lblPopulateClassSelect() {
@@ -1035,7 +1126,11 @@ function lblSelectImage(name) {
         }
       }
       const img = document.getElementById('lbl-img');
-      img.onload = () => lblRedraw();
+      img.onload = () => {
+        lblRedraw();
+        const auto = document.getElementById('lbl-auto');
+        if (auto && auto.checked && lblBoxes.length === 0) lblAutoDetect();
+      };
       img.src = '/captures/img/' + encodeURIComponent(name) + '?t=' + Date.now();
     })
     .catch(() => {});
@@ -1227,6 +1322,35 @@ function lblAddClass() {
       }
     })
     .catch(() => {});
+}
+
+// Rough auto-annotation: ask the server for CV-proposed boxes and append them
+// to the current image's boxes for the user to review, correct, and save.
+let lblAutoBusy = false;
+function lblAutoDetect() {
+  if (!lblCurrent || lblAutoBusy) return;   // guard against double-run duplicates
+  lblAutoBusy = true;
+  const sts = document.getElementById('lbl-sts');
+  sts.style.color = '#8b949e';
+  sts.textContent = 'Auto-detecting\\u2026';
+  fetch('/captures/autolabel/' + encodeURIComponent(lblCurrent), {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        (d.boxes || []).forEach(b => lblBoxes.push(b));
+        lblSel = -1;
+        lblRedraw();
+        sts.style.color = (d.count > 0) ? '#3fb950' : '#8b949e';
+        sts.textContent = (d.count > 0)
+          ? ('\\u2713 +' + d.count + ' rough \\u2014 review & save')
+          : 'no objects found';
+      } else {
+        sts.style.color = '#f85149';
+        sts.textContent = d.error || 'auto-detect failed';
+      }
+    })
+    .catch(() => { sts.style.color = '#f85149'; sts.textContent = 'request failed'; })
+    .finally(() => { lblAutoBusy = false; });
 }
 
 // Redraw on window resize (boxes stay in normalized coords)
@@ -1543,6 +1667,35 @@ class WebControlNode(Node):
         with self._classes_lock:
             n_classes = len(self._classes)
         return _yolo_parse(txt, n_classes)
+
+    def autolabel(self, name: str) -> tuple:
+        """Propose rough boxes for capture *name* via CV colour-blob detection.
+
+        Returns ``(True, {'boxes': [...], 'count': n})`` where each box is
+        ``{'cls', 'cx', 'cy', 'w', 'h'}`` with ``cls`` set to the index of the
+        ``sock`` class if it exists, else ``0``. Returns ``(False, reason_str)``
+        on a bad name, missing image, or decode failure. Boxes are rough and
+        meant for human review before saving.
+        """
+        safe = _safe_capture_name(name)
+        if safe is None:
+            return False, 'invalid filename'
+        data = self.read_capture_image(safe)
+        if data is None:
+            return False, 'image not found'
+        try:
+            import cv2
+            arr = np.frombuffer(data, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except ImportError:
+            return False, 'cv2 not available for auto-annotation'
+        if img is None:
+            return False, 'image decode failed'
+        raw = rough_boxes_from_bgr(img)
+        with self._classes_lock:
+            cls = self._classes.index('sock') if 'sock' in self._classes else 0
+        boxes = [{'cls': cls, **b} for b in raw]
+        return True, {'boxes': boxes, 'count': len(boxes)}
 
     def write_labels(self, name: str, boxes: list) -> tuple:
         """Validate and write a YOLO sidecar for *name*.
@@ -2005,6 +2158,20 @@ async def handle_post_labels(request: web.Request) -> web.Response:
     return web.json_response({'ok': False, 'error': info}, status=400)
 
 
+async def handle_autolabel(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    name = request.match_info['name']
+    ok, info = node.autolabel(name)
+    if ok:
+        return web.json_response({'ok': True, **info})
+    status = 400
+    if info == 'image not found':
+        status = 404
+    elif info.startswith('cv2 not available'):
+        status = 503
+    return web.json_response({'ok': False, 'error': info}, status=status)
+
+
 async def handle_add_class(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     try:
@@ -2045,6 +2212,7 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/captures/img/{name}', handle_capture_img)
     app.router.add_get('/captures/labels/{name}', handle_get_labels)
     app.router.add_post('/captures/labels/{name}', handle_post_labels)
+    app.router.add_post('/captures/autolabel/{name}', handle_autolabel)
     app.router.add_post('/captures/classes', handle_add_class)
     return app
 
