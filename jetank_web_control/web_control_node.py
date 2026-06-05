@@ -40,6 +40,7 @@ from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage, Image
 from nav2_msgs.action import NavigateToPose
+from vision_msgs.msg import Detection2DArray
 
 try:
     import numpy as np
@@ -207,6 +208,7 @@ _HTML = """<!DOCTYPE html>
   .cam{flex:1;display:flex;align-items:center;justify-content:center;
        background:#010409;position:relative;overflow:hidden}
   #cam-img{max-width:100%;max-height:100%;object-fit:contain;display:block}
+  .cam-det{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
   .cam-overlay{position:absolute;top:8px;left:8px;font-size:.68rem;color:#58a6ff;
                background:rgba(0,0,0,.55);padding:2px 6px;border-radius:4px;
                pointer-events:none}
@@ -393,6 +395,7 @@ _HTML = """<!DOCTYPE html>
   <div class="cam">
     <img id="cam-img" src="/stream.mjpg" alt="camera"
          onerror="scheduleReconnectStream()" onload="onImgLoad()">
+    <canvas id="det-overlay" class="cam-det"></canvas>
     <div class="cam-overlay">left camera</div>
   </div>
 
@@ -400,7 +403,9 @@ _HTML = """<!DOCTYPE html>
   <div class="capture-bar">
     <button class="mbtn" id="capture-btn" onclick="capture()">&#x1F4F7; Capture</button>
     <button class="mbtn" id="label-btn" onclick="openLabeler()">&#x1F3F7; Label</button>
+    <button class="mbtn" id="det-btn" onclick="toggleDetections()">&#x1F441; Detections</button>
     <span class="capture-sts" id="capture-sts">0 saved</span>
+    <span class="capture-sts" id="det-sts"></span>
   </div>
 
   <!-- mapping panel: desktop only, shown when mapping mode is active -->
@@ -527,7 +532,9 @@ _HTML = """<!DOCTYPE html>
     <label class="lbl-auto-lbl"><input type="checkbox" id="lbl-auto"> Auto (rough)</label>
     <span id="lbl-sts"></span>
     <div class="lbl-hint">Drag on the image to draw a box; click a box to select it.
-      &#x2728; Auto proposes rough boxes (review &amp; save); the toggle auto-runs on unlabelled images.</div>
+      &#x2728; Auto proposes rough boxes (review &amp; save); the toggle auto-runs on unlabelled images.<br>
+      Keys: <b>Enter</b> save+next &middot; <b>E/]</b> next &middot; <b>Q/[</b> prev &middot;
+      <b>R</b> auto-detect &middot; <b>X/Del</b> delete box &middot; <b>Esc</b> deselect &middot; <b>1-9,0</b> class</div>
   </div>
 </div>
 
@@ -603,6 +610,8 @@ const KEY_MAP = {
   Space:[0,0],
 };
 document.addEventListener('keydown', e => {
+  // Don't drive the robot while the annotation panel is open.
+  if (document.getElementById('label-panel').classList.contains('open')) return;
   if (KEY_MAP[e.code] !== undefined) { keysDown.add(e.code); e.preventDefault(); }
 });
 document.addEventListener('keyup', e => {
@@ -774,6 +783,80 @@ function scheduleReconnectStream() {
   reconnectTimer = setTimeout(() => {
     camImg.src = '/stream.mjpg?' + Date.now();
   }, 2000);
+}
+
+// ===========================================================================
+// Live detection overlay (toggle). Polls /detections/latest and draws the
+// sock detector's boxes over the camera stream. Requires the detector to be
+// running (e.g. sim_demo.launch.py detect:=true with a trained model); when no
+// detector publishes, the overlay just stays empty.
+// ===========================================================================
+let detOn = false;
+let detTimer = null;
+const DET_POLL_MS = 100;   // 10 Hz
+
+function toggleDetections() {
+  detOn = !detOn;
+  const btn = document.getElementById('det-btn');
+  const sts = document.getElementById('det-sts');
+  if (detOn) {
+    btn.classList.add('mbtn-on');
+    detTimer = setInterval(detPoll, DET_POLL_MS);
+    detPoll();
+  } else {
+    btn.classList.remove('mbtn-on');
+    clearInterval(detTimer); detTimer = null;
+    sts.textContent = '';
+    const cv = document.getElementById('det-overlay');
+    const ctx = cv.getContext('2d');
+    ctx.clearRect(0, 0, cv.width, cv.height);
+  }
+}
+
+function detPoll() {
+  fetch('/detections/latest')
+    .then(r => r.json())
+    .then(d => { if (detOn && d.ok) detDraw(d.boxes || [], d.age); })
+    .catch(() => {});
+}
+
+// Boxes are in source-image pixel coords; normalize against the camera frame's
+// natural size, then map onto the contained (letterboxed) image rect. The
+// server already drops stale detections, so an empty list clears the overlay.
+function detDraw(boxes, age) {
+  const cv = document.getElementById('det-overlay');
+  cv.width = cv.clientWidth;
+  cv.height = cv.clientHeight;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height);   // always clear first — no frozen box
+
+  const sts = document.getElementById('det-sts');
+  sts.textContent = boxes.length ? (boxes.length + ' det')
+                                  : (age === null ? 'no detector' : 'searching\\u2026');
+
+  const natW = camImg.naturalWidth, natH = camImg.naturalHeight;
+  if (!natW || !natH || !boxes.length) return;
+  const er = camImg.getBoundingClientRect();
+  const cr = cv.getBoundingClientRect();
+  const scale = Math.min(er.width / natW, er.height / natH);
+  const dispW = natW * scale, dispH = natH * scale;
+  const ox = (er.left + (er.width - dispW) / 2) - cr.left;
+  const oy = (er.top  + (er.height - dispH) / 2) - cr.top;
+
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#3fb950';
+  ctx.fillStyle = '#3fb950';
+  ctx.font = '13px monospace';
+  boxes.forEach(b => {
+    const x = ox + ((b.cx - b.w / 2) / natW) * dispW;
+    const y = oy + ((b.cy - b.h / 2) / natH) * dispH;
+    const w = (b.w / natW) * dispW;
+    const h = (b.h / natH) * dispH;
+    ctx.strokeRect(x, y, w, h);
+    const tag = b.label ? (b.label + ' ' + b.score.toFixed(2)) : b.score.toFixed(2);
+    const ty = y - 4 > 10 ? y - 4 : y + 14;
+    ctx.fillText(tag, x + 2, ty);
+  });
 }
 
 // ===========================================================================
@@ -1291,6 +1374,10 @@ function lblSaveLabels() {
         sts.style.color = '#3fb950';
         sts.textContent = '\\u2713 saved';
         lblUpdateBadge(lblCurrent, lblBoxes);
+        // Reflect new state in the in-memory list so it survives re-render.
+        const cur = lblImages.find(im => im.name === lblCurrent);
+        if (cur) { cur.labelled = lblBoxes.length > 0; cur.n_boxes = lblBoxes.length; }
+        lblSelectNext();
       } else {
         sts.style.color = '#f85149';
         sts.textContent = d.error || 'save failed';
@@ -1298,6 +1385,66 @@ function lblSaveLabels() {
     })
     .catch(() => { sts.style.color = '#f85149'; sts.textContent = 'request failed'; });
 }
+
+// Advance to the next image in the list after a save. Stops at the last image.
+function lblSelectNext() {
+  if (!lblImages.length) return;
+  const idx = lblImages.findIndex(im => im.name === lblCurrent);
+  if (idx < 0 || idx + 1 >= lblImages.length) {
+    const sts = document.getElementById('lbl-sts');
+    sts.style.color = '#8b949e';
+    sts.textContent = '\\u2713 saved \\u2014 last image';
+    return;
+  }
+  const next = lblImages[idx + 1];
+  lblSelectImage(next.name);
+  // Keep the newly-selected row visible in the scrolling list.
+  const row = document.querySelector('.lbl-row[data-name="' + CSS.escape(next.name) + '"]');
+  if (row && row.scrollIntoView) row.scrollIntoView({block: 'nearest'});
+}
+
+// Step back to the previous image in the list. Stops at the first image.
+function lblSelectPrev() {
+  if (!lblImages.length) return;
+  const idx = lblImages.findIndex(im => im.name === lblCurrent);
+  if (idx <= 0) return;
+  const prev = lblImages[idx - 1];
+  lblSelectImage(prev.name);
+  const row = document.querySelector('.lbl-row[data-name="' + CSS.escape(prev.name) + '"]');
+  if (row && row.scrollIntoView) row.scrollIntoView({block: 'nearest'});
+}
+
+// Annotation hotkeys. Active ONLY while the labeller panel is open, and ignored
+// while typing in a text field / select. Non-WASD keys to avoid the drive map.
+document.addEventListener('keydown', e => {
+  const panel = document.getElementById('label-panel');
+  if (!panel || !panel.classList.contains('open')) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
+
+  switch (e.code) {
+    case 'Enter':        lblSaveLabels(); break;                 // save (auto-advances to next)
+    case 'KeyE':
+    case 'BracketRight': lblSelectNext(); break;                 // next image
+    case 'KeyQ':
+    case 'BracketLeft':  lblSelectPrev(); break;                 // previous image
+    case 'KeyR':         lblAutoDetect(); break;                 // rough auto-detect
+    case 'KeyX':
+    case 'Delete':
+    case 'Backspace':    lblDeleteBox(); break;                  // delete selected box
+    case 'Escape':       lblSel = -1; lblRedraw(); break;        // deselect
+    default: {
+      // Digits 1-9 / 0 select the class index (0 = 10th class).
+      const m = /^Digit([0-9])$/.exec(e.code);
+      if (!m) return;                                            // unhandled: leave default
+      const n = parseInt(m[1], 10);
+      const idx = (n === 0) ? 9 : n - 1;
+      const sel = document.getElementById('lbl-class');
+      if (sel && idx < sel.options.length) sel.value = idx;
+    }
+  }
+  e.preventDefault();
+});
 
 function lblAddClass() {
   const inp = document.getElementById('lbl-newclass');
@@ -1399,6 +1546,10 @@ class WebControlNode(Node):
         self.declare_parameter('capture_dir', os.path.expanduser('~/datasets/detection'))
         # Default class names written to classes.txt if it doesn't exist yet.
         self.declare_parameter('capture_classes', ['object'])
+        # Live detection overlay: topic carrying Detection2DArray from the sock
+        # detector (jetank_detection). The web UI "Detections" toggle draws these
+        # boxes over the camera stream. Stays empty when no detector is running.
+        self.declare_parameter('detections_topic', '/detections/socks')
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -1455,12 +1606,22 @@ class WebControlNode(Node):
         self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose',
                                  self._on_amcl_pose, 10)
 
+        # Latest detections (from jetank_detection) for the live overlay.
+        # Boxes are stored in source-image pixel coords; the browser normalizes
+        # against the camera frame's natural size.
+        self._det_lock = threading.Lock()
+        self._latest_dets: list = []
+        self._latest_dets_mono = 0.0
+
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
         if image_compressed:
             self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
         else:
             self.create_subscription(Image, image_topic, self._on_raw_image, 10)
         self.create_subscription(OccupancyGrid, '/map', self._on_map, 1)
+        detections_topic = self.get_parameter('detections_topic').value
+        self.create_subscription(Detection2DArray, detections_topic,
+                                 self._on_detections, 10)
 
         # Watchdog: stop robot if commands stop arriving
         self.create_timer(0.1, self._watchdog_cb)
@@ -1770,6 +1931,52 @@ class WebControlNode(Node):
         with self._map_lock:
             return dict(self._map_meta)
 
+    def _on_detections(self, msg: Detection2DArray):
+        """Cache the latest sock detections for the live web overlay.
+
+        Boxes are kept in source-image pixel coords (bbox center + size); the
+        browser normalizes them against the camera frame's natural size.
+        """
+        boxes = []
+        for det in msg.detections:
+            label, score = '', 0.0
+            if det.results:
+                hyp = det.results[0].hypothesis
+                label, score = hyp.class_id, float(hyp.score)
+            boxes.append({
+                'cx': round(float(det.bbox.center.position.x), 2),
+                'cy': round(float(det.bbox.center.position.y), 2),
+                'w': round(float(det.bbox.size_x), 2),
+                'h': round(float(det.bbox.size_y), 2),
+                'label': label,
+                'score': round(score, 3),
+            })
+        with self._det_lock:
+            self._latest_dets = boxes
+            self._latest_dets_mono = time.monotonic()
+
+    # Detections older than this are considered stale (detector stopped /
+    # on-demand finished) and are NOT served — otherwise the last box would
+    # freeze on the overlay forever.
+    DET_STALE_SEC = 1.0
+
+    def get_detections(self) -> dict:
+        """Latest detections + age in seconds.
+
+        Returns empty boxes when no detector has ever published (`age=None`) or
+        when the last message is stale (`fresh=False`), so the overlay clears
+        instead of freezing on an old box.
+        """
+        with self._det_lock:
+            boxes = list(self._latest_dets)
+            stamp = self._latest_dets_mono
+        if not stamp:
+            return {'ok': True, 'boxes': [], 'age': None, 'fresh': False}
+        age = time.monotonic() - stamp
+        fresh = age <= self.DET_STALE_SEC
+        return {'ok': True, 'boxes': boxes if fresh else [],
+                'age': round(age, 3), 'fresh': fresh}
+
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
         q = msg.pose.pose.orientation
         yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -2046,6 +2253,11 @@ async def handle_websocket(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def handle_detections(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.get_detections())
+
+
 async def handle_map_png(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     data = node.get_map_png()
@@ -2197,6 +2409,7 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/', handle_index)
     app.router.add_get('/stream.mjpg', handle_mjpeg)
     app.router.add_get('/ws', handle_websocket)
+    app.router.add_get('/detections/latest', handle_detections)
     app.router.add_get('/map.png', handle_map_png)
     app.router.add_get('/map_meta', handle_map_meta)
     app.router.add_post('/save_map', handle_save_map)
