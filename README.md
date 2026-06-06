@@ -307,3 +307,82 @@ ros2 launch jetank_web_control web_control.launch.py \
 | "No stream" badge | Confirm camera node is running and topic exists: `ros2 topic list \| grep image_raw` |
 | Robot doesn't move | Confirm motor controller is running: `ros2 topic echo /cmd_vel` while moving the joystick |
 | `ModuleNotFoundError: aiohttp` | `pip3 install aiohttp` |
+
+---
+
+## ROS 2 API
+
+`jetank_web_control` (ament_python) runs a browser-based teleop/streaming server and a sim cmd_vel mux. The browser-facing HTTP/WebSocket endpoints (e.g. `/`, `/stream.mjpg`, `/ws`, `/map.png`, `/capture`, `/captures/*`, `/navigate`, `/grab`) are **not** ROS interfaces and are not listed here; only the ROS 2 wire API is documented below.
+
+### Nodes
+
+| Node | Executable | Role |
+|------|-----------|------|
+| `web_control_node` | `web_control_node` | HTTP/WebSocket server: streams the left camera, publishes teleop `cmd_vel`, drives Nav2 (NavigateToPose) + optional grasp (GraspObject), serves the live map and capture/label dataset tools. |
+| `cmd_vel_bridge` | `cmd_vel_bridge` | Sim-only mux: combines web-teleop + Nav2 `Twist` streams (teleop priority) and republishes `TwistStamped` for Gazebo's diff_drive_controller. Launched only when `sim:=true`. |
+
+### Published topics
+
+| Topic | Type | Node |
+|-------|------|------|
+| `/cmd_vel` (param `cmd_vel_topic`; remapped to `/cmd_vel_teleop` when `sim:=true`) | `geometry_msgs/Twist` | `web_control_node` |
+| `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | `web_control_node` |
+| `/diff_drive_controller/cmd_vel` (param `output_topic`) | `geometry_msgs/TwistStamped` | `cmd_vel_bridge` |
+
+### Subscribed topics
+
+| Topic | Type | Node |
+|-------|------|------|
+| `/stereo_camera/left/image_raw/compressed` (param `image_topic`, when `image_compressed=true`) | `sensor_msgs/CompressedImage` | `web_control_node` |
+| `/stereo_camera/left/image_raw` (param `image_topic`, when `image_compressed=false` / sim) | `sensor_msgs/Image` | `web_control_node` |
+| `/map` | `nav_msgs/OccupancyGrid` | `web_control_node` |
+| `/amcl_pose` | `geometry_msgs/PoseWithCovarianceStamped` | `web_control_node` |
+| `/detections/socks` (param `detections_topic`) | `vision_msgs/Detection2DArray` | `web_control_node` |
+| `/cmd_vel_teleop` (param `teleop_topic`) | `geometry_msgs/Twist` | `cmd_vel_bridge` |
+| `/cmd_vel` (param `nav_topic`) | `geometry_msgs/Twist` | `cmd_vel_bridge` |
+
+### Actions (clients)
+
+| Action | Type | Role |
+|--------|------|------|
+| `/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | `web_control_node` client — click-to-navigate goals. |
+| `/grasp_object` | `jetank_manipulation/action/GraspObject` | `web_control_node` client — Grab button. Optional: created only if `jetank_manipulation` is importable; otherwise the Grab button is disabled. |
+
+This package defines no `action/`, `srv/`, or `msg/` interfaces of its own.
+
+### Key parameters
+
+#### `web_control_node`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `web_port` | `8080` | HTTP server port. |
+| `image_topic` | `/stereo_camera/left/image_raw/compressed` | Camera topic streamed (launch sets raw topic in sim). |
+| `image_compressed` | `true` | `true` → subscribe `CompressedImage`; `false` → raw `Image` + local JPEG encode. |
+| `cmd_vel_topic` | `/cmd_vel` | Teleop `Twist` output topic (launch sets `/cmd_vel_teleop` in sim). |
+| `max_linear_speed` | `0.5` | Max linear speed (m/s). |
+| `max_angular_speed` | `1.0` | Max angular speed (rad/s). |
+| `cmd_timeout_sec` | `0.5` | Watchdog: publish zero `Twist` if no command for this long. |
+| `sim` | `false` | Sim mode flag. |
+| `map_dir` | `~/maps` | Map save/load directory. |
+| `sim_map_name` | `sim_map` | Saved-map basename in sim. |
+| `initial_pose_x` / `initial_pose_y` / `initial_pose_yaw` | `0.0` | Seed pose republished to `/initialpose` for AMCL. |
+| `capture_dir` | `~/datasets/detection` | Directory for captured JPEGs + YOLO labels. |
+| `capture_classes` | `['object']` | Initial class list seeded into `classes.txt`. |
+| `detections_topic` | `/detections/socks` | `Detection2DArray` topic for the live overlay. |
+
+#### `cmd_vel_bridge`
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `teleop_topic` | `/cmd_vel_teleop` | Web-teleop `Twist` input. |
+| `nav_topic` | `/cmd_vel` | Nav2 `Twist` input. |
+| `output_topic` | `/diff_drive_controller/cmd_vel` | Muxed `TwistStamped` output. |
+| `frame_id` | `base_link` | Header frame for output `TwistStamped`. |
+| `rate_hz` | `20.0` | Output publish rate. |
+| `teleop_timeout` | `0.4` | Seconds before a teleop command is considered stale. |
+| `nav_timeout` | `0.5` | Seconds before a Nav2 command is considered stale. |
+
+### Launch
+
+`web_control.launch.py` — args: `web_port` (8080), `image_topic` (auto), `cmd_vel_topic` (/cmd_vel), `max_linear` (0.5), `max_angular` (1.0), `sim` (false), `output_cmd_vel` (/diff_drive_controller/cmd_vel), `nav_cmd_vel` (/cmd_vel). With `sim:=true` it also starts `cmd_vel_bridge` and enables `use_sim_time`.
