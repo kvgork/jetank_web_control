@@ -143,8 +143,33 @@ format** — ready for `yolov8 train` or any YOLO-compatible pipeline.
 3. **Drag** on the image to draw a box; the current class from the dropdown is
    assigned.  A plain **click** on a box selects it (highlighted in orange).
 4. Use **Delete box** to remove the selected box.
-5. Click **Save** to persist the labels.  The badge updates immediately.
+5. Click **Save** to persist the labels.  The badge updates immediately **and the
+   panel auto-advances to the next image** in the list (stops on the last one).
 6. Add new class names with the text input + **+** button.
+
+**Auto-detect (rough pre-labelling):** the **✨ Auto-detect** button calls
+`POST /captures/autolabel/{name}` and proposes rough boxes for review. It is a
+**CV colour-blob detector** (HSV saturation/value threshold → contours), **not a
+trained model** — it has no `sock`/object concept, just "saturated blob on a
+plain floor". It bootstraps the *first* dataset before any model exists. Known
+limit: it **misses white / low-saturation objects** (they don't clear the
+saturation threshold) — draw those by hand. The **Auto (rough)** checkbox runs it
+automatically on each unlabelled image as you open it. (Model-assisted
+pre-labelling with a trained YOLO `.pt` is a planned upgrade, not wired yet.)
+
+**Hotkeys** (active only while the Label panel is open; ignored while typing in a
+text field). Drive keys (WASD/arrows) are disabled while the panel is open so you
+can't move the robot mid-label:
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Save labels (then auto-advance to next image) |
+| `E` / `]` | Next image |
+| `Q` / `[` | Previous image |
+| `R` | Auto-detect (rough colour-blob boxes) |
+| `X` / `Del` / `Backspace` | Delete the selected box |
+| `Esc` | Deselect the current box |
+| `1`–`9`, `0` | Pick class index (`0` = 10th class) |
 
 **Label format (YOLO detection — `*.txt` sidecars):**
 
@@ -167,8 +192,33 @@ parameter is ignored.
 | `GET`  | `/captures/img/{name}` | Raw JPEG bytes (`image/jpeg`) or `404 {ok:false}` |
 | `GET`  | `/captures/labels/{name}` | `{ok:true, boxes:[{cls,cx,cy,w,h},...], classes:[...]}` or `404` |
 | `POST` | `/captures/labels/{name}` | Body `{boxes:[...]}` — write YOLO sidecar; `{ok:true}` or `400 {ok:false,error}` |
+| `POST` | `/captures/autolabel/{name}` | Propose rough boxes via **CV colour-blob** (not a model); `{ok:true, boxes:[...]}` |
 | `POST` | `/captures/classes` | Body `{name}` — append class; returns `{ok:true,classes:[...],index:n}` |
+| `GET`  | `/detections/latest` | Latest live detections: `{ok:true, boxes:[{cx,cy,w,h,label,score},...], age}` (px coords, `age` = seconds since last message or `null`) |
 
+#### Live detection overlay
+
+A **👁 Detections** toggle in the capture bar draws the sock detector's
+bounding boxes live over the left camera stream. The node subscribes to
+`Detection2DArray` on `detections_topic` (default `/detections/socks`); the
+browser polls `/detections/latest` at 10 Hz and overlays the boxes (label +
+score) on a canvas above the stream. Toggle off to hide and stop polling.
+
+This is a **display** toggle — it shows whatever the detector publishes. You
+still need the detector **running with a trained model**:
+
+```bash
+# sim: starts the detector (continuous) alongside Gazebo + web UI
+ros2 launch jetank_ros_main sim_demo.launch.py world:=sock_arena detect:=true \
+    slam:=false web:=true        # then pass model_path_sim:=/path/to/sock_sim.pt
+ros2 lifecycle set /sock_detector configure && ros2 lifecycle set /sock_detector activate
+```
+
+With no detector running, the overlay stays empty and the status reads
+`no detector`. Box coords are pixels in the detector's input image; the browser
+normalizes against the camera frame's natural size, so detector input topic and
+the streamed camera should share resolution (they do in sim — both
+`/stereo_camera/left/image_raw`).
 
 **Velocity muxing:** the web teleop publishes `/cmd_vel_teleop` and Nav2 publishes
 `/cmd_vel`; `cmd_vel_bridge` muxes them (teleop wins only while actively non-zero)

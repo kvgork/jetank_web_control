@@ -105,6 +105,7 @@ try:
     _safe_capture_name = _mod._safe_capture_name
     _yolo_parse = _mod._yolo_parse
     _yolo_serialize = _mod._yolo_serialize
+    rough_boxes_from_bgr = _mod.rough_boxes_from_bgr
 except Exception as exc:
     pytest.skip(f'Could not import web_control_node: {exc}', allow_module_level=True)
 
@@ -288,3 +289,51 @@ class TestYoloSerialize:
             assert abs(a['cy'] - b['cy']) < 1e-5
             assert abs(a['w'] - b['w']) < 1e-5
             assert abs(a['h'] - b['h']) < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# rough_boxes_from_bgr (CV auto-annotation helper)
+# ---------------------------------------------------------------------------
+
+np = pytest.importorskip('numpy')
+cv2 = pytest.importorskip('cv2')
+
+
+class TestRoughBoxesFromBgr:
+    def _gray_floor(self, h=200, w=200):
+        # Equal channels -> zero saturation, like the plain sim floor.
+        return np.full((h, w, 3), 128, dtype=np.uint8)
+
+    def test_blank_floor_no_boxes(self):
+        assert rough_boxes_from_bgr(self._gray_floor()) == []
+
+    def test_detects_saturated_blob(self):
+        img = self._gray_floor()
+        # A saturated red rectangle (BGR) on the floor: rows 50-90, cols 60-120.
+        img[50:90, 60:120] = (0, 0, 255)
+        boxes = rough_boxes_from_bgr(img)
+        assert len(boxes) >= 1
+        b = boxes[0]
+        # Box centre should land inside the painted rectangle.
+        assert 0.30 <= b['cx'] <= 0.60
+        assert 0.25 <= b['cy'] <= 0.45
+        assert 0.0 < b['w'] <= 1.0 and 0.0 < b['h'] <= 1.0
+
+    def test_returns_normalized_coords(self):
+        img = self._gray_floor()
+        img[20:60, 20:60] = (255, 0, 0)  # saturated blue
+        for b in rough_boxes_from_bgr(img):
+            for k in ('cx', 'cy', 'w', 'h'):
+                assert 0.0 <= b[k] <= 1.0
+
+    def test_none_image_returns_empty(self):
+        assert rough_boxes_from_bgr(None) == []
+
+    def test_largest_first_and_capped(self):
+        img = self._gray_floor(300, 300)
+        img[10:30, 10:30] = (0, 255, 0)      # small
+        img[100:200, 100:250] = (0, 255, 0)  # large
+        boxes = rough_boxes_from_bgr(img, max_boxes=5)
+        assert len(boxes) <= 5
+        if len(boxes) >= 2:
+            assert boxes[0]['w'] * boxes[0]['h'] >= boxes[1]['w'] * boxes[1]['h']
