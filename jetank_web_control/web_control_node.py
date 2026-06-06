@@ -1735,6 +1735,7 @@ class WebControlNode(Node):
         self._grasp_stage: str = ''
         self._grasp_last_success: Optional[bool] = None
         self._grasp_last_message: str = ''
+        self._grasp_started_at: float = 0.0  # monotonic; watchdog clears stuck runs
         if self._grasp_available:
             self._grasp_client = ActionClient(
                 self, _GraspObjectAction, '/grasp_object')
@@ -2118,12 +2119,15 @@ class WebControlNode(Node):
         with self._grasp_lock:
             if self._grasp_running:
                 return False, 'grasp already running'
+            # Non-blocking readiness check only — wait_for_server() would block
+            # the aiohttp event loop. The client discovers the server in the
+            # background ROS executor thread, so server_is_ready() flips on its own.
             if not self._grasp_client.server_is_ready():
-                if not self._grasp_client.wait_for_server(timeout_sec=1.0):
-                    return False, 'grasp action server not ready'
+                return False, 'grasp action server not ready'
             goal = _GraspObjectAction.Goal()
             goal.object_hint = str(object_hint)
             self._grasp_running = True
+            self._grasp_started_at = time.monotonic()
             self._grasp_stage = 'sending goal'
             self._grasp_last_success = None
             self._grasp_last_message = ''
@@ -2183,9 +2187,20 @@ class WebControlNode(Node):
         self.get_logger().info(
             f'GraspObject result: success={result.success} msg={result.message}')
 
+    GRASP_MAX_RUN_SEC = 60.0  # watchdog: clear a run whose callbacks never fired
+
     def grasp_status(self) -> dict:
         """Return a thread-safe snapshot of grasp state for the web handler."""
         with self._grasp_lock:
+            # Watchdog: if a run exceeds the cap (e.g. the action server died
+            # mid-goal and no result callback ever fires), clear it so the UI
+            # button doesn't stay stuck-disabled forever.
+            if (self._grasp_running
+                    and time.monotonic() - self._grasp_started_at > self.GRASP_MAX_RUN_SEC):
+                self._grasp_running = False
+                self._grasp_stage = ''
+                self._grasp_last_success = False
+                self._grasp_last_message = 'timed out (no result from action server)'
             return {
                 'available': self._grasp_available,
                 'running': self._grasp_running,
