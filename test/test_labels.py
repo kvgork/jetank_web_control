@@ -58,6 +58,10 @@ def _install_stubs():
         'nav_msgs', 'nav_msgs.msg',
         'sensor_msgs', 'sensor_msgs.msg',
         'nav2_msgs', 'nav2_msgs.action',
+        'vision_msgs', 'vision_msgs.msg',
+        # jetank_manipulation is imported with try/except in the module, so
+        # no stub is strictly needed; add it anyway for offline test runs.
+        'jetank_manipulation', 'jetank_manipulation.action',
     ]:
         if pkg not in sys.modules:
             _make_stub(pkg)
@@ -66,6 +70,7 @@ def _install_stubs():
     _ensure_attr('nav_msgs.msg', 'OccupancyGrid')
     _ensure_attr('sensor_msgs.msg', 'CompressedImage', 'Image')
     _ensure_attr('nav2_msgs.action', 'NavigateToPose')
+    _ensure_attr('vision_msgs.msg', 'Detection2DArray')
 
     # ---- aiohttp ----
     # The module does `from aiohttp import web; import aiohttp` inside a
