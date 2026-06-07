@@ -386,3 +386,31 @@ This package defines no `action/`, `srv/`, or `msg/` interfaces of its own.
 ### Launch
 
 `web_control.launch.py` — args: `web_port` (8080), `image_topic` (auto), `cmd_vel_topic` (/cmd_vel), `max_linear` (0.5), `max_angular` (1.0), `sim` (false), `output_cmd_vel` (/diff_drive_controller/cmd_vel), `nav_cmd_vel` (/cmd_vel). With `sim:=true` it also starts `cmd_vel_bridge` and enables `use_sim_time`.
+
+## Tests
+
+Pure-logic unit tests (no ROS context / `rclpy.init()` / aiohttp server). They
+import the package's real modules and stub `rclpy`/message types/`aiohttp` only
+when those packages are absent, so the suite runs in a bare env too. **59 tests
+total.**
+
+| File | Imports | Asserts |
+|------|---------|---------|
+| `test/test_labels.py` (38) | `web_control_node._safe_capture_name`, `_yolo_parse`, `_yolo_serialize`, `rough_boxes_from_bgr` | Capture-filename sanitizer rejects path traversal / wrong extensions; YOLO sidecar parse drops malformed/out-of-range lines and round-trips with serialize (6-decimal format); CV colour-blob detector returns normalized largest-first boxes (empty on a plain floor). |
+| `test/test_cmd_vel_bridge.py` (21) | `cmd_vel_bridge._is_nonzero`, `cmd_vel_bridge.CmdVelBridge._tick`, `web_control_node.WebControlNode.apply_cmd` | `_is_nonzero` 1e-3 dead-band on linear.x/y + angular.z; `_tick` mux priority (fresh non-zero teleop wins, else fresh nav, else zero) run against a fake `self`; `apply_cmd` clamps input to [-1, 1] then scales by per-axis max speed. |
+
+`rough_boxes_from_bgr` tests are skipped if `numpy`/`cv2` are unavailable.
+
+Run (Python directly):
+
+```bash
+pixi run -- bash -c 'cd src/jetank_web_control && python -m pytest test/ -q'
+```
+
+Run under colcon (test collection fixed via `extras_require={'test': ['pytest']}`
+in `setup.py` — previously reported "NO TESTS RAN"):
+
+```bash
+colcon test --packages-select jetank_web_control
+colcon test-result --verbose
+```

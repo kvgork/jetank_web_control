@@ -14,12 +14,16 @@ setup(
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
     ],
     install_requires=['setuptools'],
+    # Declares pytest as a test dependency via extras_require (NOT the legacy
+    # tests_require, which modern setuptools silently drops). colcon-ros only
+    # runs pytest when it can see a 'test' dependency here; otherwise it falls
+    # back to `setup.py test` (unittest) and collects zero tests.
+    extras_require={'test': ['pytest']},
     zip_safe=True,
     maintainer='koen',
     maintainer_email='gorkom.projects@gmail.com',
     description='Web-based remote control interface for the JeTank robot',
     license='MIT',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'web_control_node = jetank_web_control.web_control_node:main',
