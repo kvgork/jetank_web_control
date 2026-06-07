@@ -74,9 +74,9 @@ _SAFE_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+\.[Jj][Pp][Gg]$')
 
 
 def _safe_capture_name(name: str) -> Optional[str]:
-    """Return *name* if it is a safe bare filename (no path separators, no ..).
+    r"""Return *name* if it is a safe bare filename (no path separators, no ..).
 
-    Accepts filenames matching ``^[A-Za-z0-9._-]+\\.jpg$`` (case-insensitive
+    Accepts filenames matching ``^[A-Za-z0-9._-]+\.jpg$`` (case-insensitive
     extension).  Returns ``None`` for anything else.
     """
     if not name or '/' in name or '\\' in name or name == '..':
@@ -121,17 +121,15 @@ def _yolo_parse(text: str, n_classes: int) -> list:
 
 
 def _yolo_serialize(boxes: list) -> str:
-    """Serialize a list of box dicts to YOLO-format text.
+    r"""Serialize a list of box dicts to YOLO-format text.
 
-    Returns an empty string for an empty list.  Each line ends with ``\\n``.
+    Returns an empty string for an empty list.  Each line ends with ``\n``.
     Coords are formatted to 6 decimal places.
     """
-    lines = []
-    for b in boxes:
-        lines.append(
-            f"{b['cls']} {b['cx']:.6f} {b['cy']:.6f} {b['w']:.6f} {b['h']:.6f}\n"
-        )
-    return ''.join(lines)
+    return ''.join(
+        f"{b['cls']} {b['cx']:.6f} {b['cy']:.6f} {b['w']:.6f} {b['h']:.6f}\n"
+        for b in boxes
+    )
 
 
 def rough_boxes_from_bgr(img, sat_min=70, val_min=40, min_area_frac=0.0006,
@@ -1771,8 +1769,7 @@ class WebControlNode(Node):
         if os.path.isfile(self._classes_path):
             try:
                 with open(self._classes_path, 'r', encoding='utf-8') as f:
-                    lines = [l.strip() for l in f if l.strip()]
-                self._classes = lines
+                    self._classes = [ln.strip() for ln in f if ln.strip()]
                 return
             except OSError:
                 pass
@@ -1782,7 +1779,7 @@ class WebControlNode(Node):
         self._write_classes_file()
 
     def _write_classes_file(self) -> None:
-        """Persist self._classes to classes.txt (caller must hold _classes_lock or be in __init__)."""
+        """Persist self._classes to classes.txt (caller holds _classes_lock or is __init__)."""
         try:
             with open(self._classes_path, 'w', encoding='utf-8') as f:
                 for name in self._classes:
@@ -1835,7 +1832,7 @@ class WebControlNode(Node):
         data = np.frombuffer(bytes(msg.data), dtype=np.int8).reshape((h, w))
         rgb = np.full((h, w, 3), 128, dtype=np.uint8)   # unknown = mid-gray
         rgb[data == 0] = [220, 220, 220]                 # free = light
-        rgb[data > 0]  = [20,  20,  20]                  # occupied = dark
+        rgb[data > 0] = [20, 20, 20]                      # occupied = dark
         img = _PILImage.fromarray(np.flipud(rgb), 'RGB')
         buf = io.BytesIO()
         img.save(buf, format='PNG', optimize=True)
@@ -2049,7 +2046,7 @@ class WebControlNode(Node):
         with self._classes_lock:
             if name in self._classes:
                 return True, {'classes': list(self._classes),
-                               'index': self._classes.index(name)}
+                              'index': self._classes.index(name)}
             self._classes.append(name)
             idx = len(self._classes) - 1
             classes_copy = list(self._classes)
@@ -2284,7 +2281,7 @@ class WebControlNode(Node):
         if not self.has_saved_map():
             return False, 'no saved map — run mapping and Save Map first'
         self._launch_nav('navigation', 'nav2_bringup.launch.py',
-                          [f'map:={self.saved_map_yaml()}'])
+                         [f'map:={self.saved_map_yaml()}'])
         # AMCL needs an initial pose or it never publishes map->odom (nav is then
         # dead). Seed /initialpose a few times once AMCL has come up.
         threading.Thread(target=self._seed_initial_pose, daemon=True).start()
@@ -2364,8 +2361,11 @@ class WebControlNode(Node):
         return False, (res.stderr.strip() or res.stdout.strip() or 'map_saver failed')
 
     def navigate_to_pixel(self, ix: int, iy: int) -> tuple:
-        """Convert a click on the rendered /map.png (which is vertically
-        flipped) to a map-frame pose and send a NavigateToPose goal."""
+        """Convert a /map.png pixel click to a map pose and send a goal.
+
+        The rendered PNG is vertically flipped, so the row is un-flipped before
+        converting to a map-frame pose for the NavigateToPose action.
+        """
         with self._map_lock:
             meta = dict(self._map_meta)
             ox, oy = self._map_origin
@@ -2406,7 +2406,7 @@ class WebControlNode(Node):
         self.get_logger().info('NavigateToPose goal accepted')
 
     def apply_cmd(self, linear_x: float, angular_z: float):
-        lx = max(-1.0, min(1.0, linear_x))  * self._max_linear
+        lx = max(-1.0, min(1.0, linear_x)) * self._max_linear
         az = max(-1.0, min(1.0, angular_z)) * self._max_angular
         self._publish_twist(lx, az)
         with self._cmd_lock:
