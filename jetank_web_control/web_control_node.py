@@ -19,6 +19,8 @@ Endpoints:
   POST /captures/labels/{name}      - write YOLO label boxes for a capture
   POST /captures/autolabel/{name}   - propose rough boxes via CV colour-blob
   POST /captures/classes            - add a new detection class
+  POST /grab                        - trigger GraspObject action (503 when unavailable)
+  GET  /grab/status                 - grasp state JSON {available,running,stage,...}
 """
 
 import asyncio
@@ -48,6 +50,13 @@ try:
     _PIL_AVAILABLE = True
 except ImportError:
     _PIL_AVAILABLE = False
+
+try:
+    from jetank_manipulation.action import GraspObject as _GraspObjectAction
+    _GRASP_AVAILABLE = True
+except ImportError:
+    _GraspObjectAction = None
+    _GRASP_AVAILABLE = False
 
 try:
     from aiohttp import web
@@ -327,6 +336,9 @@ _HTML = """<!DOCTYPE html>
   /* mapping-mode toggle button states */
   .mbtn-on{background:#238636;border-color:#2ea043;color:#fff}
   .mbtn-on:hover{background:#2ea043}
+  /* grab button status text */
+  .grab-sts{font-size:.68rem;color:#8b949e;margin-top:4px;min-height:1.2em}
+  .grab-sts.ok{color:#3fb950}.grab-sts.err{color:#f85149}
 
   /* ---- label panel (desktop only) ----------------------------------- */
   .label-panel{display:none;position:fixed;top:0;right:0;bottom:0;
@@ -484,6 +496,11 @@ _HTML = """<!DOCTYPE html>
         &#x1F5FA; Mapping Mode
       </button>
     </div>
+    <div class="section">
+      <div class="stitle">Arm</div>
+      <button class="mbtn" id="grab-btn-d" onclick="grab()">&#x1F9B2; Grab</button>
+      <div class="grab-sts" id="grab-sts-d"></div>
+    </div>
   </div>
 
   <!-- phone panel -->
@@ -497,6 +514,8 @@ _HTML = """<!DOCTYPE html>
       <input type="range" id="spd-p" min="5" max="100" value="50">
       <span id="spd-label-p">50 %</span>
     </div>
+    <button class="mbtn" id="grab-btn-p" onclick="grab()" style="width:100%;max-width:360px">&#x1F9B2; Grab</button>
+    <div class="grab-sts" id="grab-sts-p" style="text-align:center"></div>
     <div class="joystick-wrap">
       <div id="joystick">
         <span class="jlabel top">&#x25B2;</span>
@@ -1504,10 +1523,106 @@ function lblAutoDetect() {
 window.addEventListener('resize', () => { if (lblCurrent) lblRedraw(); });
 
 // ===========================================================================
+// Grab (arm action)
+// ===========================================================================
+let grabPolling = false;
+let grabPollTimer = null;
+
+function grabSetStatus(text, cls) {
+  ['grab-sts-d', 'grab-sts-p'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.textContent = text;
+    el.className = 'grab-sts' + (cls ? ' ' + cls : '');
+  });
+}
+
+function grabSetBtnsDisabled(disabled) {
+  ['grab-btn-d', 'grab-btn-p'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  });
+}
+
+function grabStartPoll() {
+  if (grabPolling) return;
+  grabPolling = true;
+  grabPollTimer = setInterval(grabPoll, 500);
+}
+
+function grabStopPoll() {
+  grabPolling = false;
+  clearInterval(grabPollTimer);
+  grabPollTimer = null;
+}
+
+function grabPoll() {
+  fetch('/grab/status')
+    .then(r => r.json())
+    .then(d => {
+      if (!d.available) {
+        grabSetStatus('unavailable', '');
+        grabSetBtnsDisabled(true);
+        grabStopPoll();
+        return;
+      }
+      if (d.running) {
+        grabSetStatus(d.stage || 'running\u2026', '');
+        grabSetBtnsDisabled(true);
+      } else {
+        grabStopPoll();
+        grabSetBtnsDisabled(false);
+        if (d.last_success === true) {
+          grabSetStatus('\u2713 ' + (d.last_message || 'success'), 'ok');
+        } else if (d.last_success === false) {
+          grabSetStatus('\u2717 ' + (d.last_message || 'failed'), 'err');
+        } else {
+          grabSetStatus('', '');
+        }
+      }
+    })
+    .catch(() => {});
+}
+
+function grab() {
+  grabSetBtnsDisabled(true);
+  grabSetStatus('sending\u2026', '');
+  fetch('/grab', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                  body: JSON.stringify({object_hint: ''})})
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        grabSetStatus('goal sent', '');
+        grabStartPoll();
+      } else {
+        grabSetStatus('\u2717 ' + (d.status || 'error'), 'err');
+        grabSetBtnsDisabled(false);
+      }
+    })
+    .catch(() => {
+      grabSetStatus('\u2717 request failed', 'err');
+      grabSetBtnsDisabled(false);
+    });
+}
+
+function grabCheckAvailability() {
+  fetch('/grab/status')
+    .then(r => r.json())
+    .then(d => {
+      if (!d.available) {
+        grabSetStatus('unavailable', '');
+        grabSetBtnsDisabled(true);
+      }
+    })
+    .catch(() => {});
+}
+
+// ===========================================================================
 // Boot
 // ===========================================================================
 connect();
 if (!isTouch) startMapRefresh();   // map panel is always shown under the camera
+grabCheckAvailability();
 </script>
 </body>
 </html>
@@ -1612,6 +1727,24 @@ class WebControlNode(Node):
         self._det_lock = threading.Lock()
         self._latest_dets: list = []
         self._latest_dets_mono = 0.0
+
+        # GraspObject action client — guarded so the node starts if jetank_manipulation absent.
+        self._grasp_available = _GRASP_AVAILABLE
+        self._grasp_lock = threading.Lock()
+        self._grasp_running = False
+        self._grasp_stage: str = ''
+        self._grasp_last_success: Optional[bool] = None
+        self._grasp_last_message: str = ''
+        self._grasp_started_at: float = 0.0  # monotonic; watchdog clears stuck runs
+        if self._grasp_available:
+            self._grasp_client = ActionClient(
+                self, _GraspObjectAction, '/grasp_object')
+            self.get_logger().info(
+                'GraspObject action client created on /grasp_object')
+        else:
+            self._grasp_client = None
+            self.get_logger().warn(
+                'jetank_manipulation not found — Grab button will be disabled')
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
         if image_compressed:
@@ -1976,6 +2109,105 @@ class WebControlNode(Node):
         fresh = age <= self.DET_STALE_SEC
         return {'ok': True, 'boxes': boxes if fresh else [],
                 'age': round(age, 3), 'fresh': fresh}
+
+    # ---- grasp action client -----------------------------------------------
+
+    def start_grasp(self, object_hint: str = '') -> tuple:
+        """Send a GraspObject goal.  Returns (True, 'ok') or (False, reason_str)."""
+        if not self._grasp_available or self._grasp_client is None:
+            return False, 'jetank_manipulation not available'
+        with self._grasp_lock:
+            if self._grasp_running:
+                return False, 'grasp already running'
+            # Non-blocking readiness check only — wait_for_server() would block
+            # the aiohttp event loop. The client discovers the server in the
+            # background ROS executor thread, so server_is_ready() flips on its own.
+            if not self._grasp_client.server_is_ready():
+                return False, 'grasp action server not ready'
+            goal = _GraspObjectAction.Goal()
+            goal.object_hint = str(object_hint)
+            self._grasp_running = True
+            self._grasp_started_at = time.monotonic()
+            self._grasp_stage = 'sending goal'
+            self._grasp_last_success = None
+            self._grasp_last_message = ''
+        future = self._grasp_client.send_goal_async(
+            goal, feedback_callback=self._on_grasp_feedback)
+        future.add_done_callback(self._on_grasp_goal_response)
+        self.get_logger().info('GraspObject goal sent')
+        return True, 'ok'
+
+    def _on_grasp_goal_response(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'GraspObject send failed: {exc}')
+            with self._grasp_lock:
+                self._grasp_running = False
+                self._grasp_stage = ''
+                self._grasp_last_success = False
+                self._grasp_last_message = f'send failed: {exc}'
+            return
+        if not handle.accepted:
+            self.get_logger().warn('GraspObject goal REJECTED')
+            with self._grasp_lock:
+                self._grasp_running = False
+                self._grasp_stage = ''
+                self._grasp_last_success = False
+                self._grasp_last_message = 'goal rejected'
+            return
+        self.get_logger().info('GraspObject goal accepted')
+        with self._grasp_lock:
+            self._grasp_stage = 'accepted'
+        result_future = handle.get_result_async()
+        result_future.add_done_callback(self._on_grasp_result)
+
+    def _on_grasp_feedback(self, feedback_msg):
+        stage = feedback_msg.feedback.stage
+        with self._grasp_lock:
+            self._grasp_stage = stage
+        self.get_logger().info(f'GraspObject feedback: {stage}')
+
+    def _on_grasp_result(self, future):
+        try:
+            result = future.result().result
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'GraspObject result failed: {exc}')
+            with self._grasp_lock:
+                self._grasp_running = False
+                self._grasp_stage = ''
+                self._grasp_last_success = False
+                self._grasp_last_message = f'result error: {exc}'
+            return
+        with self._grasp_lock:
+            self._grasp_running = False
+            self._grasp_stage = ''
+            self._grasp_last_success = bool(result.success)
+            self._grasp_last_message = str(result.message)
+        self.get_logger().info(
+            f'GraspObject result: success={result.success} msg={result.message}')
+
+    GRASP_MAX_RUN_SEC = 60.0  # watchdog: clear a run whose callbacks never fired
+
+    def grasp_status(self) -> dict:
+        """Return a thread-safe snapshot of grasp state for the web handler."""
+        with self._grasp_lock:
+            # Watchdog: if a run exceeds the cap (e.g. the action server died
+            # mid-goal and no result callback ever fires), clear it so the UI
+            # button doesn't stay stuck-disabled forever.
+            if (self._grasp_running
+                    and time.monotonic() - self._grasp_started_at > self.GRASP_MAX_RUN_SEC):
+                self._grasp_running = False
+                self._grasp_stage = ''
+                self._grasp_last_success = False
+                self._grasp_last_message = 'timed out (no result from action server)'
+            return {
+                'available': self._grasp_available,
+                'running': self._grasp_running,
+                'stage': self._grasp_stage,
+                'last_success': self._grasp_last_success,
+                'last_message': self._grasp_last_message,
+            }
 
     def _on_amcl_pose(self, msg: PoseWithCovarianceStamped):
         q = msg.pose.pose.orientation
@@ -2399,6 +2631,25 @@ async def handle_add_class(request: web.Request) -> web.Response:
     return web.json_response({'ok': False, 'error': info}, status=400)
 
 
+async def handle_grab(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    try:
+        body = await request.json()
+        hint = body.get('object_hint', '') if isinstance(body, dict) else ''
+    except Exception:  # noqa: BLE001
+        hint = ''
+    ok, reason = node.start_grasp(hint)
+    if ok:
+        return web.json_response({'ok': True, 'status': 'goal sent'})
+    status = 503 if ('not available' in reason or 'not ready' in reason) else 409
+    return web.json_response({'ok': False, 'status': reason}, status=status)
+
+
+async def handle_grab_status(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.grasp_status())
+
+
 # ---------------------------------------------------------------------------
 # Server lifecycle
 # ---------------------------------------------------------------------------
@@ -2427,6 +2678,8 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_post('/captures/labels/{name}', handle_post_labels)
     app.router.add_post('/captures/autolabel/{name}', handle_autolabel)
     app.router.add_post('/captures/classes', handle_add_class)
+    app.router.add_post('/grab', handle_grab)
+    app.router.add_get('/grab/status', handle_grab_status)
     return app
 
 
