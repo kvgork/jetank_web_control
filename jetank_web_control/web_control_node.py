@@ -26,6 +26,10 @@ Endpoints:
   GET  /mission/deposit             - deposit pose {x,y} or {"set":false}
   GET  /mission/status              - latest mission status JSON {status,active}
   POST /mission/cancel              - cancel the active RunMission goal (no-op if none)
+  POST /start_mapping               - start slam_toolbox (mapping only; teleop to drive)
+  POST /start_navigation            - start nav2 + AMCL on saved map
+  POST /stop_nav                    - stop whichever nav stack is running
+  GET  /nav_status                  - {running, has_map, ...}
 """
 
 import asyncio
@@ -552,7 +556,7 @@ _HTML = """<!DOCTYPE html>
       <button class="mbtn" id="stop-nav-btn" onclick="stopNav()">Stop</button>
       <span class="map-save-sts" id="map-save-sts"></span>
       <span class="map-save-sts" id="mission-sts"></span>
-      <div class="map-hint" id="nav-hint">Start mapping (or load a saved map), then click the map to send the robot there.</div>
+      <div class="map-hint" id="nav-hint">Start mapping and drive with the joystick to build a map, or load a saved map and Navigate.</div>
     </div>
   </div>
   </div><!-- /cam-col -->
@@ -1001,7 +1005,7 @@ function toggleMappingMode() {
   const btn = document.getElementById('map-toggle-btn');
   if (mappingMode) {
     btn.classList.add('mbtn-on');
-    btn.innerHTML = '&#x1F5FA; Stop Nav';
+    btn.innerHTML = '&#x23F9; Stop Mapping';
     startMapping();
   } else {
     btn.classList.remove('mbtn-on');
@@ -1209,9 +1213,10 @@ function refreshNavStatus() {
     .then(r => r.ok ? r.json() : null)
     .then(s => {
       if (!s) return;
+      navRunning = s.running;
       document.getElementById('start-nav-btn').disabled = !s.has_map;
       const hint = document.getElementById('nav-hint');
-      if (s.running === 'mapping')      hint.textContent = 'Mapping active \\u00B7 drive to build the map, then click it to navigate.';
+      if (s.running === 'mapping')      hint.textContent = 'Mapping active \\u00B7 drive with the joystick to build the map, then Save Map.';
       else if (s.running === 'navigation') hint.textContent = 'Navigation active (saved map) \\u00B7 click the map to send the robot.';
       else hint.textContent = s.has_map ? 'Saved map available \\u00B7 Start Mapping or Navigate (saved map).'
                                         : 'Start Mapping, drive around, then Save Map.';
@@ -1260,6 +1265,7 @@ function stopNav() {
 // Map click-mode: 'navigate' (existing NavigateToPose), 'fetch' (mission goal),
 // or 'deposit' (store deposit area). Default keeps the original behaviour.
 let mapMode = 'navigate';
+let navRunning = null;
 
 function setMapMode(mode) {
   mapMode = mode;
@@ -1290,6 +1296,7 @@ function clickToPixel(ev) {
 function mapClick(ev) {
   const px = clickToPixel(ev);
   if (!px) return;
+  if (navRunning === 'mapping') { navMsg('Driving mode \\u2014 use the joystick to build the map, then Save Map.', true); return; }
   if (mapMode === 'fetch')   { sendMissionGoal(px.x, px.y); return; }
   if (mapMode === 'deposit') { setDeposit(px.x, px.y); return; }
   // ---- navigate mode (unchanged behaviour) ----
@@ -2621,8 +2628,8 @@ class WebControlNode(Node):
         self.get_logger().info(f'nav stack started [{mode}]: {" ".join(cmd)}')
 
     def start_mapping(self) -> tuple:
-        self._launch_nav('mapping', 'slam_nav2.launch.py', [])
-        return True, 'mapping started (slam_toolbox + nav2)'
+        self._launch_nav('mapping', 'slam.launch.py', [])
+        return True, 'mapping started (slam_toolbox only — drive with the joystick, then Save Map)'
 
     def start_navigation(self) -> tuple:
         if not self.has_saved_map():
