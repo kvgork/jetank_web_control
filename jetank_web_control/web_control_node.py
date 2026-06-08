@@ -1282,14 +1282,31 @@ function missionMsg(text, ok) {
   sts.textContent = text;
 }
 
-// Compute the /map.png pixel under a click (scaled to the image natural size).
+// Compute the /map.png pixel under a click.
+// #map-img is object-fit:contain, so the rendered map is letterboxed inside the
+// element box (black bars on the axis where the panel is bigger than the map's
+// aspect). Map the click through the SAME geometry worldToCanvas uses — scale =
+// min(width/natW, height/natH), content centred — or only the middle band is
+// reachable on the letterboxed axis. (The old code divided by the full element
+// box, so a panel wider than the ~101x89 map made only the middle COLUMNS
+// selectable: lots of range top-to-bottom, almost none left-to-right.)
 function clickToPixel(ev) {
   const img = document.getElementById('map-img');
   if (!img.naturalWidth) return null;
   const r = img.getBoundingClientRect();
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  const scale = Math.min(r.width / natW, r.height / natH);
+  const cw = natW * scale, ch = natH * scale;
+  const contentLeft = (r.width - cw) / 2;
+  const contentTop  = (r.height - ch) / 2;
+  const lx = (ev.clientX - r.left) - contentLeft;
+  const ly = (ev.clientY - r.top)  - contentTop;
+  if (lx < 0 || ly < 0 || lx > cw || ly > ch) return null;  // clicked the letterbox
+  // Clamp to valid PNG indices: the rightmost/bottom edge band would otherwise
+  // round up to natW/natH (one past the last cell).
   return {
-    x: Math.round((ev.clientX - r.left) / r.width  * img.naturalWidth),
-    y: Math.round((ev.clientY - r.top)  / r.height * img.naturalHeight),
+    x: Math.min(natW - 1, Math.max(0, Math.round(lx / scale))),
+    y: Math.min(natH - 1, Math.max(0, Math.round(ly / scale))),
   };
 }
 
