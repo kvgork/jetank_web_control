@@ -21,9 +21,11 @@ Endpoints:
   POST /captures/classes            - add a new detection class
   POST /grab                        - trigger GraspObject action (503 when unavailable)
   GET  /grab/status                 - grasp state JSON {available,running,stage,...}
-  POST /mission/goal                - {ix,iy} pixel -> publish PoseStamped on /mission/goal
+  POST /mission/goal                - {ix,iy} pixel -> send a RunMission goal (fetch)
   POST /mission/deposit             - {ix,iy} pixel -> store + persist deposit pose
   GET  /mission/deposit             - deposit pose {x,y} or {"set":false}
+  GET  /mission/status              - latest mission status JSON {status,active}
+  POST /mission/cancel              - cancel the active RunMission goal (no-op if none)
 """
 
 import asyncio
@@ -41,11 +43,25 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import CompressedImage, Image
 from nav2_msgs.action import NavigateToPose
 from vision_msgs.msg import Detection2DArray
+from std_msgs.msg import String
+
+try:
+    from jetank_mission.action import RunMission as _RunMissionAction
+    _MISSION_AVAILABLE = True
+except ImportError:
+    _RunMissionAction = None
+    _MISSION_AVAILABLE = False
 
 try:
     import numpy as np
@@ -187,6 +203,31 @@ def deposit_parse(text: str) -> Optional[tuple]:
         return float(data['x']), float(data['y'])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+# Terminal mission states: once the cached /mission/status reaches one of these
+# the UI stops polling. DONE/FAILED/CANCELLED come from the coordinator's
+# feedback/status; IDLE is the coordinator's resting state (also when no mission
+# is active). Matching is case-insensitive and tolerant of trailing punctuation
+# (e.g. "DONE ✓" / "FAILED — reason").
+_TERMINAL_MISSION_STATES = frozenset({'DONE', 'FAILED', 'CANCELLED', 'IDLE'})
+
+
+def is_terminal_mission_status(status) -> bool:
+    """Return True if *status* is a terminal mission state (stop polling).
+
+    Terminal states are DONE / FAILED / CANCELLED / IDLE. The first whitespace-
+    delimited token of *status* is matched case-insensitively so suffixes added
+    by the UI/coordinator (e.g. ``"FAILED — no sock found"``) still count.
+    Empty / None / non-string input is treated as terminal (nothing to poll).
+    Pure / unit-testable: no ROS / aiohttp deps. Never raises.
+    """
+    if not isinstance(status, str):
+        return True
+    stripped = status.strip()
+    if not stripped:                       # empty / whitespace -> nothing to poll
+        return True
+    return stripped.split()[0].upper() in _TERMINAL_MISSION_STATES
 
 
 def rough_boxes_from_bgr(img, sat_min=70, val_min=40, min_area_frac=0.0006,
@@ -504,6 +545,7 @@ _HTML = """<!DOCTYPE html>
       <button class="mbtn map-mode mbtn-on" id="mode-navigate" onclick="setMapMode('navigate')">Navigate</button>
       <button class="mbtn map-mode" id="mode-fetch" onclick="setMapMode('fetch')">&#x1F3AF; Fetch sock</button>
       <button class="mbtn map-mode" id="mode-deposit" onclick="setMapMode('deposit')">&#x1F4E5; Set deposit area</button>
+      <button class="mbtn" id="cancel-mission-btn" onclick="cancelMission()">&#x2715; Cancel mission</button>
       <button class="mbtn" id="start-map-btn" onclick="startMapping()">Start Mapping</button>
       <button class="mbtn" id="start-nav-btn" onclick="startNavigation()" disabled>Navigate (saved map)</button>
       <button class="mbtn" id="save-map-btn" onclick="saveMap()">Save Map</button>
@@ -1277,12 +1319,70 @@ function sendMissionGoal(ix, iy) {
       if (ok && d.x !== undefined) {
         fetchMarker = {x: d.x, y: d.y};
         redrawOverlay();
-        missionMsg('\\u2713 Goal sent (' + d.x + ', ' + d.y + ') m', true);
+        if (d.status === 'mission_unavailable') {
+          missionMsg('Mission: server unavailable', false);
+        } else {
+          missionMsg('Mission: started\\u2026', true);
+          startMissionPoll();   // live status until terminal
+        }
       } else {
         missionMsg(d.msg || 'no map', false);
       }
     })
     .catch(() => missionMsg('Request failed', false));
+}
+
+// ---- Live mission status polling (M6) -------------------------------------
+let missionPollTimer = null;
+const MISSION_POLL_MS = 1000;
+
+// Map a coordinator status token to a friendly UI line. Terminal states get a
+// check / cross; in-progress states get an ellipsis.
+function missionLine(status) {
+  const tok = (status || '').trim().split(/\\s+/)[0].toUpperCase();
+  if (tok === 'DONE')               return ['Mission: DONE \\u2713', true];
+  if (tok === 'FAILED')             return ['Mission: FAILED \\u2014 ' + status.replace(/^FAILED\\s*[\\u2014-]*\\s*/i, ''), false];
+  if (tok === 'CANCELLED')          return ['Mission: cancelled', false];
+  if (tok === 'IDLE' || tok === '') return ['', true];
+  return ['Mission: ' + tok + '\\u2026', true];
+}
+
+function startMissionPoll() {
+  if (missionPollTimer) return;
+  missionPoll();
+  missionPollTimer = setInterval(missionPoll, MISSION_POLL_MS);
+}
+
+function stopMissionPoll() {
+  if (missionPollTimer) { clearInterval(missionPollTimer); missionPollTimer = null; }
+}
+
+function missionPoll() {
+  fetch('/mission/status')
+    .then(r => r.ok ? r.json() : null)
+    .then(s => {
+      if (!s) return;
+      const [text, ok] = missionLine(s.status);
+      if (text) missionMsg(text, ok);
+      // Stop once the coordinator reports a terminal state AND nothing is active.
+      if (isTerminalStatus(s.status) && !s.active) stopMissionPoll();
+    })
+    .catch(() => {});
+}
+
+// Mirrors the server-side is_terminal_mission_status helper (kept in sync).
+function isTerminalStatus(status) {
+  if (!status) return true;
+  const tok = status.trim().split(/\\s+/)[0].toUpperCase();
+  return ['DONE', 'FAILED', 'CANCELLED', 'IDLE'].includes(tok);
+}
+
+function cancelMission() {
+  missionMsg('Cancelling\\u2026', false);
+  fetch('/mission/cancel', {method: 'POST'})
+    .then(r => r.json())
+    .then(() => { /* status poll will reflect CANCELLED */ })
+    .catch(() => missionMsg('Cancel request failed', false));
 }
 
 function setDeposit(ix, iy) {
@@ -1924,9 +2024,37 @@ class WebControlNode(Node):
         self._initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
         # Web map-click mission (M1): a "fetch" click publishes a goal point on
-        # /mission/goal (consumed by the mission_coordinator in M2); a "deposit"
-        # click stores a persisted deposit pose for the DEPOSIT step.
+        # /mission/goal (kept as harmless debug); a "deposit" click stores a
+        # persisted deposit pose for the DEPOSIT step.
         self._mission_goal_pub = self.create_publisher(PoseStamped, '/mission/goal', 10)
+
+        # Web map-click mission (M6): a "fetch" click sends a RunMission goal to
+        # the mission_coordinator action server and tracks live status.
+        self._mission_available = _MISSION_AVAILABLE
+        self._mission_lock = threading.Lock()
+        self._mission_status: str = 'IDLE'   # cached /mission/status + feedback/result
+        self._mission_goal_handle = None     # active goal handle (for cancel)
+        self._mission_active = False         # a goal is in flight
+        if self._mission_available:
+            self._mission_client = ActionClient(
+                self, _RunMissionAction, '/mission_coordinator/run_mission')
+            # The coordinator publishes /mission/status latched (transient-local),
+            # so subscribe transient-local to catch the last value on connect.
+            status_qos = QoSProfile(
+                depth=1,
+                history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            self.create_subscription(
+                String, '/mission/status', self._on_mission_status, status_qos)
+            self.get_logger().info(
+                'RunMission action client created on '
+                '/mission_coordinator/run_mission')
+        else:
+            self._mission_client = None
+            self.get_logger().warn(
+                'jetank_mission not found — Fetch mission will be disabled')
         self._deposit_file = os.path.expanduser(
             self.get_parameter('deposit_file').value)
         self._deposit_lock = threading.Lock()
@@ -2637,11 +2765,17 @@ class WebControlNode(Node):
             ix, iy, meta['resolution'], meta['width'], meta['height'], ox, oy)
 
     def publish_mission_goal_from_pixel(self, ix: int, iy: int) -> tuple:
-        """Convert a map pixel to a world point and publish it on /mission/goal.
+        """Convert a map pixel to a world point and START a fetch mission there.
 
-        Returns ``(True, {'x','y'})`` on success, ``(False, reason)`` if no map
-        is available yet. The mission_coordinator (M2) consumes the published
-        ``PoseStamped``; this node only publishes it.
+        Builds the ``site`` PoseStamped (map frame), publishes it on
+        ``/mission/goal`` (harmless debug, kept from M1), and sends a RunMission
+        goal to the mission_coordinator action server (search_timeout=0 ->
+        coordinator default). Tracks the goal handle so it can be cancelled.
+
+        Returns ``(True, {'x','y','status'})`` where ``status`` is
+        ``'mission_started'`` (goal sent) or ``'mission_unavailable'`` (the
+        action server isn't up / jetank_mission absent). ``(False, reason)`` if
+        no map is available yet.
         """
         world = self._pixel_to_world_locked(ix, iy)
         if world is None:
@@ -2653,9 +2787,110 @@ class WebControlNode(Node):
         ps.pose.position.x = float(wx)
         ps.pose.position.y = float(wy)
         ps.pose.orientation.w = 1.0
+        # Harmless debug publish (kept from M1).
         self._mission_goal_pub.publish(ps)
         self.get_logger().info(f'mission goal -> map ({wx:.2f}, {wy:.2f})')
-        return True, {'x': round(wx, 3), 'y': round(wy, 3)}
+
+        info = {'x': round(wx, 3), 'y': round(wy, 3)}
+        # Non-blocking readiness check only — wait_for_server() would block the
+        # ROS executor thread. The client discovers the server in the background.
+        if (not self._mission_available or self._mission_client is None
+                or not self._mission_client.server_is_ready()):
+            info['status'] = 'mission_unavailable'
+            return True, info
+
+        goal = _RunMissionAction.Goal()
+        goal.site = ps
+        goal.search_timeout = 0.0   # 0 -> coordinator default
+        with self._mission_lock:
+            self._mission_active = True
+            self._mission_status = 'NAVIGATE_TO_SITE'
+        future = self._mission_client.send_goal_async(
+            goal, feedback_callback=self._on_mission_feedback)
+        future.add_done_callback(self._on_mission_goal_response)
+        self.get_logger().info('RunMission goal sent')
+        info['status'] = 'mission_started'
+        return True, info
+
+    # ---- RunMission action client callbacks -------------------------------
+
+    def _on_mission_status(self, msg: String):
+        """Cache the latest latched /mission/status from the coordinator."""
+        with self._mission_lock:
+            self._mission_status = str(msg.data)
+
+    def _on_mission_feedback(self, feedback_msg):
+        state = feedback_msg.feedback.state
+        with self._mission_lock:
+            self._mission_status = str(state)
+        self.get_logger().info(f'RunMission feedback: {state}')
+
+    def _on_mission_goal_response(self, future):
+        try:
+            handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'RunMission send failed: {exc}')
+            with self._mission_lock:
+                self._mission_active = False
+                self._mission_goal_handle = None
+                self._mission_status = f'FAILED — send failed: {exc}'
+            return
+        if not handle.accepted:
+            self.get_logger().warn('RunMission goal REJECTED')
+            with self._mission_lock:
+                self._mission_active = False
+                self._mission_goal_handle = None
+                self._mission_status = 'FAILED — goal rejected'
+            return
+        self.get_logger().info('RunMission goal accepted')
+        with self._mission_lock:
+            self._mission_goal_handle = handle
+        result_future = handle.get_result_async()
+        result_future.add_done_callback(self._on_mission_result)
+
+    def _on_mission_result(self, future):
+        try:
+            result = future.result().result
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'RunMission result failed: {exc}')
+            with self._mission_lock:
+                self._mission_active = False
+                self._mission_goal_handle = None
+                self._mission_status = f'FAILED — result error: {exc}'
+            return
+        # The coordinator publishes DONE/FAILED via /mission/status + feedback;
+        # only fold the result in if the cache hasn't already gone terminal so we
+        # keep the coordinator's richer text (e.g. the FAILED reason).
+        with self._mission_lock:
+            self._mission_active = False
+            self._mission_goal_handle = None
+            if not is_terminal_mission_status(self._mission_status):
+                self._mission_status = (
+                    'DONE' if result.success
+                    else f'FAILED — {result.outcome}')
+        self.get_logger().info(
+            f'RunMission result: success={result.success} '
+            f'outcome={result.outcome}')
+
+    def mission_status(self) -> dict:
+        """Thread-safe snapshot of the mission status for the web handler."""
+        with self._mission_lock:
+            return {'status': self._mission_status,
+                    'active': self._mission_active}
+
+    def cancel_mission(self) -> tuple:
+        """Cancel the active RunMission goal (no-op if none). (ok, message)."""
+        with self._mission_lock:
+            handle = self._mission_goal_handle
+        if handle is None:
+            return True, 'no active mission'
+        try:
+            handle.cancel_goal_async()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'RunMission cancel failed: {exc}')
+            return False, f'cancel failed: {exc}'
+        self.get_logger().info('RunMission cancel requested')
+        return True, 'cancel requested'
 
     def set_deposit_from_pixel(self, ix: int, iy: int) -> tuple:
         """Store + persist a deposit pose from a map pixel click.
@@ -2864,8 +3099,21 @@ async def handle_mission_goal(request: web.Request) -> web.Response:
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
     if ok:
+        # info: {'x','y','status': 'mission_started'|'mission_unavailable'}
         return web.json_response(info)
     return web.json_response({'status': 'error', 'msg': info}, status=404)
+
+
+async def handle_mission_status(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    return web.json_response(node.mission_status())
+
+
+async def handle_mission_cancel(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    ok, msg = node.cancel_mission()
+    return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
+                             status=200 if ok else 500)
 
 
 async def handle_set_deposit(request: web.Request) -> web.Response:
@@ -3005,6 +3253,8 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/robot_pose', handle_robot_pose)
     app.router.add_post('/navigate', handle_navigate)
     app.router.add_post('/mission/goal', handle_mission_goal)
+    app.router.add_get('/mission/status', handle_mission_status)
+    app.router.add_post('/mission/cancel', handle_mission_cancel)
     app.router.add_post('/mission/deposit', handle_set_deposit)
     app.router.add_get('/mission/deposit', handle_get_deposit)
     app.router.add_post('/capture', handle_capture)

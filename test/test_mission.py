@@ -47,6 +47,11 @@ def _install_stubs():
             action_stub = _make_stub('rclpy.action')
             action_stub.ActionClient = object
             rclpy_stub.action = action_stub
+            qos_stub = _make_stub('rclpy.qos')
+            for _q in ('DurabilityPolicy', 'HistoryPolicy', 'QoSProfile',
+                       'ReliabilityPolicy'):
+                setattr(qos_stub, _q, object)
+            rclpy_stub.qos = qos_stub
 
     for pkg in [
         'geometry_msgs', 'geometry_msgs.msg',
@@ -54,7 +59,9 @@ def _install_stubs():
         'sensor_msgs', 'sensor_msgs.msg',
         'nav2_msgs', 'nav2_msgs.action',
         'vision_msgs', 'vision_msgs.msg',
+        'std_msgs', 'std_msgs.msg',
         'jetank_manipulation', 'jetank_manipulation.action',
+        'jetank_mission', 'jetank_mission.action',
     ]:
         if pkg not in sys.modules:
             _make_stub(pkg)
@@ -65,6 +72,7 @@ def _install_stubs():
     _ensure_attr('sensor_msgs.msg', 'CompressedImage', 'Image')
     _ensure_attr('nav2_msgs.action', 'NavigateToPose')
     _ensure_attr('vision_msgs.msg', 'Detection2DArray')
+    _ensure_attr('std_msgs.msg', 'String')
 
     if 'aiohttp' not in sys.modules:
         try:
@@ -93,6 +101,7 @@ try:
     map_pixel_to_world = _mod.map_pixel_to_world
     deposit_serialize = _mod.deposit_serialize
     deposit_parse = _mod.deposit_parse
+    is_terminal_mission_status = _mod.is_terminal_mission_status
 except Exception as exc:  # noqa: BLE001
     pytest.skip(f'Could not import web_control_node: {exc}',
                 allow_module_level=True)
@@ -220,3 +229,44 @@ class TestDepositParse:
 
     def test_none_input_returns_none(self):
         assert deposit_parse(None) is None
+
+
+# ---------------------------------------------------------------------------
+# is_terminal_mission_status
+# ---------------------------------------------------------------------------
+
+class TestIsTerminalMissionStatus:
+    def test_done_is_terminal(self):
+        assert is_terminal_mission_status('DONE') is True
+
+    def test_failed_is_terminal(self):
+        assert is_terminal_mission_status('FAILED') is True
+
+    def test_cancelled_is_terminal(self):
+        assert is_terminal_mission_status('CANCELLED') is True
+
+    def test_idle_is_terminal(self):
+        assert is_terminal_mission_status('IDLE') is True
+
+    def test_in_progress_states_not_terminal(self):
+        for s in ('NAVIGATE_TO_SITE', 'SEARCH', 'PICK',
+                  'NAVIGATE_TO_DEPOSIT', 'DEPOSIT'):
+            assert is_terminal_mission_status(s) is False
+
+    def test_case_insensitive(self):
+        assert is_terminal_mission_status('done') is True
+        assert is_terminal_mission_status('search') is False
+
+    def test_trailing_text_still_terminal(self):
+        # The coordinator/UI may append a reason after the state token.
+        assert is_terminal_mission_status('FAILED — no sock found') is True
+        assert is_terminal_mission_status('DONE ✓') is True
+
+    def test_empty_and_none_are_terminal(self):
+        assert is_terminal_mission_status('') is True
+        assert is_terminal_mission_status('   ') is True
+        assert is_terminal_mission_status(None) is True
+
+    def test_non_string_is_terminal(self):
+        assert is_terminal_mission_status(42) is True
+        assert is_terminal_mission_status(['SEARCH']) is True
