@@ -21,6 +21,9 @@ Endpoints:
   POST /captures/classes            - add a new detection class
   POST /grab                        - trigger GraspObject action (503 when unavailable)
   GET  /grab/status                 - grasp state JSON {available,running,stage,...}
+  POST /mission/goal                - {ix,iy} pixel -> publish PoseStamped on /mission/goal
+  POST /mission/deposit             - {ix,iy} pixel -> store + persist deposit pose
+  GET  /mission/deposit             - deposit pose {x,y} or {"set":false}
 """
 
 import asyncio
@@ -130,6 +133,60 @@ def _yolo_serialize(boxes: list) -> str:
         f"{b['cls']} {b['cx']:.6f} {b['cy']:.6f} {b['w']:.6f} {b['h']:.6f}\n"
         for b in boxes
     )
+
+
+def map_pixel_to_world(ix, iy, resolution, width, height,
+                       origin_x, origin_y) -> tuple:
+    """Convert a ``/map.png`` pixel ``(ix, iy)`` to a map-frame point.
+
+    The served PNG is vertically flipped (``np.flipud`` in ``_on_map``), so the
+    occupancy-grid row is recovered as ``grid_row = (height - 1) - iy`` before
+    applying the standard cell-centre conversion::
+
+        wx = origin_x + (ix + 0.5) * resolution
+        wy = origin_y + (grid_row + 0.5) * resolution
+
+    ``ix``/``iy`` are coerced to ``int`` and clamped to ``[0, width-1]`` /
+    ``[0, height-1]`` so an out-of-range click maps to the nearest edge cell.
+    Pure: no ROS / aiohttp / numpy. Returns ``(wx, wy)`` floats.
+    """
+    width = int(width)
+    height = int(height)
+    ix = max(0, min(width - 1, int(ix)))
+    iy = max(0, min(height - 1, int(iy)))
+    grid_row = (height - 1) - iy   # the PNG was flipud'd before serving
+    wx = origin_x + (ix + 0.5) * resolution
+    wy = origin_y + (grid_row + 0.5) * resolution
+    return wx, wy
+
+
+def deposit_serialize(x, y) -> str:
+    """Serialize a deposit pose ``(x, y)`` to a JSON string for persistence.
+
+    Stores ``{"x": float, "y": float}``.  Pure / unit-testable: round-trips
+    with :func:`deposit_parse`.
+    """
+    return json.dumps({'x': float(x), 'y': float(y)})
+
+
+def deposit_parse(text: str) -> Optional[tuple]:
+    """Parse persisted deposit-pose JSON back into ``(x, y)`` floats.
+
+    Returns ``None`` for empty/blank input, malformed JSON, a non-object, or a
+    payload missing numeric ``x``/``y``.  Never raises.
+    """
+    if not text or not text.strip():
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        return float(data['x']), float(data['y'])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def rough_boxes_from_bgr(img, sat_min=70, val_min=40, min_area_frac=0.0006,
@@ -323,6 +380,13 @@ _HTML = """<!DOCTYPE html>
   .mbtn:hover{background:#30363d}.mbtn:active{background:#58a6ff22}
   .mbtn:disabled{opacity:.5;cursor:default}
   .map-save-sts{font-size:.65rem;flex:1}
+  #mission-sts{flex:0 0 auto;min-width:0}
+  .map-mode-label{font-size:.65rem;color:#8b949e;white-space:nowrap}
+  /* fetch/deposit modes get distinct active colours matching their markers */
+  #mode-fetch.mbtn-on{background:#1f6feb;border-color:#388bfd;color:#fff}
+  #mode-fetch.mbtn-on:hover{background:#388bfd}
+  #mode-deposit.mbtn-on{background:#8957e5;border-color:#a371f7;color:#fff}
+  #mode-deposit.mbtn-on:hover{background:#a371f7}
   .capture-bar{display:flex;align-items:center;gap:8px;padding:6px 8px;
         background:#161b22;border-top:1px solid #30363d}
   .capture-sts{font-size:.7rem;color:#8b949e;font-family:monospace}
@@ -436,11 +500,16 @@ _HTML = """<!DOCTYPE html>
       </div>
     </div>
     <div class="map-footer">
+      <span class="map-mode-label">Click&nbsp;mode:</span>
+      <button class="mbtn map-mode mbtn-on" id="mode-navigate" onclick="setMapMode('navigate')">Navigate</button>
+      <button class="mbtn map-mode" id="mode-fetch" onclick="setMapMode('fetch')">&#x1F3AF; Fetch sock</button>
+      <button class="mbtn map-mode" id="mode-deposit" onclick="setMapMode('deposit')">&#x1F4E5; Set deposit area</button>
       <button class="mbtn" id="start-map-btn" onclick="startMapping()">Start Mapping</button>
       <button class="mbtn" id="start-nav-btn" onclick="startNavigation()" disabled>Navigate (saved map)</button>
       <button class="mbtn" id="save-map-btn" onclick="saveMap()">Save Map</button>
       <button class="mbtn" id="stop-nav-btn" onclick="stopNav()">Stop</button>
       <span class="map-save-sts" id="map-save-sts"></span>
+      <span class="map-save-sts" id="mission-sts"></span>
       <div class="map-hint" id="nav-hint">Start mapping (or load a saved map), then click the map to send the robot there.</div>
     </div>
   </div>
@@ -907,6 +976,7 @@ function startMapRefresh() {
   refreshMap();
   refreshNavStatus();
   refreshRobotPose();
+  loadDeposit();
   mapRefreshTimer = setInterval(() => {
     refreshMap(); refreshNavStatus(); refreshRobotPose();
   }, 1000);
@@ -937,36 +1007,90 @@ function refreshRobotPose() {
     .catch(() => {});
 }
 
-function drawRobotArrow(p) {
+// Last AMCL pose + mission markers — all drawn together onto the single
+// overlay canvas (redrawOverlay clears once, then draws every layer).
+let lastPose = null;       // {x,y,yaw,...} from /robot_pose
+let fetchMarker = null;    // {x,y} world point of the last fetch goal
+let depositMarker = null;  // {x,y} world point of the stored deposit area
+
+// Map a map-frame world point to overlay-canvas pixel coords, accounting for
+// the object-fit:contain letterboxing and the vertically-flipped PNG. Returns
+// {px,py,scale} or null when the geometry isn't ready yet.
+function worldToCanvas(wx, wy) {
   const img = document.getElementById('map-img');
   const cv = document.getElementById('map-overlay');
-  if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return;
-  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
-  if (!cv.width || !cv.height) return;
-  const er = img.getBoundingClientRect();   // img ELEMENT box (fills the wrap)
+  if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return null;
+  if (!cv.width || !cv.height) return null;
+  const er = img.getBoundingClientRect();
   const cr = cv.getBoundingClientRect();
   const natW = img.naturalWidth, natH = img.naturalHeight;
-  // The image is letterboxed inside the element by object-fit:contain — compute
-  // the actual rendered image rect, not the element box.
   const scale = Math.min(er.width / natW, er.height / natH);
   const cw = natW * scale, ch = natH * scale;
   const contentLeft = er.left + (er.width - cw) / 2;
   const contentTop = er.top + (er.height - ch) / 2;
-  const col = (p.x - lastMeta.origin_x) / lastMeta.resolution;
-  const gridRow = (p.y - lastMeta.origin_y) / lastMeta.resolution;
-  const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is vertically flipped
-  const px = (contentLeft - cr.left) + ix * scale;
-  const py = (contentTop - cr.top) + iy * scale;
+  const col = (wx - lastMeta.origin_x) / lastMeta.resolution;
+  const gridRow = (wy - lastMeta.origin_y) / lastMeta.resolution;
+  const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is flipped
+  return {
+    px: (contentLeft - cr.left) + ix * scale,
+    py: (contentTop - cr.top) + iy * scale,
+    scale: scale,
+  };
+}
+
+function drawMissionMarker(ctx, pt, color, label) {
+  ctx.save();
+  ctx.translate(pt.px, pt.py);
+  ctx.fillStyle = color; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(0, 0, 6, 0, Math.PI * 2);
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(-9, 0); ctx.lineTo(9, 0); ctx.moveTo(0, -9); ctx.lineTo(0, 9);
+  ctx.stroke();
+  if (label) {
+    ctx.font = '10px monospace'; ctx.fillStyle = '#fff';
+    ctx.strokeStyle = 'rgba(0,0,0,.7)'; ctx.lineWidth = 3;
+    ctx.strokeText(label, 9, -8); ctx.fillText(label, 9, -8);
+  }
+  ctx.restore();
+}
+
+function redrawOverlay() {
+  const cv = document.getElementById('map-overlay');
+  cv.width = cv.clientWidth; cv.height = cv.clientHeight;
+  if (!cv.width || !cv.height) return;
   const ctx = cv.getContext('2d');
   ctx.clearRect(0, 0, cv.width, cv.height);
-  ctx.save();
-  ctx.translate(px, py);
-  ctx.rotate(-p.yaw);                  // image y is down => screen angle = -yaw
-  ctx.fillStyle = '#ff3b30'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(16, 0); ctx.lineTo(-10, -9); ctx.lineTo(-4, 0); ctx.lineTo(-10, 9);
-  ctx.closePath(); ctx.fill(); ctx.stroke();
-  ctx.restore();
+  // deposit area (persisted) — purple
+  if (depositMarker) {
+    const d = worldToCanvas(depositMarker.x, depositMarker.y);
+    if (d) drawMissionMarker(ctx, d, '#a371f7', 'deposit');
+  }
+  // last fetch goal — blue
+  if (fetchMarker) {
+    const f = worldToCanvas(fetchMarker.x, fetchMarker.y);
+    if (f) drawMissionMarker(ctx, f, '#388bfd', 'fetch');
+  }
+  // robot pose arrow — red
+  if (lastPose) {
+    const r = worldToCanvas(lastPose.x, lastPose.y);
+    if (r) {
+      ctx.save();
+      ctx.translate(r.px, r.py);
+      ctx.rotate(-lastPose.yaw);          // image y is down => screen angle = -yaw
+      ctx.fillStyle = '#ff3b30'; ctx.strokeStyle = '#fff'; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(16, 0); ctx.lineTo(-10, -9); ctx.lineTo(-4, 0); ctx.lineTo(-10, 9);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+function drawRobotArrow(p) {
+  lastPose = p;
+  redrawOverlay();
 }
 
 function stopMapRefresh() {
@@ -988,6 +1112,8 @@ function refreshMap() {
     })
     .catch(() => {});
   document.getElementById('map-img').src = '/map.png?t=' + Date.now();
+  // keep mission markers visible even when no AMCL pose is being drawn
+  redrawOverlay();
 }
 
 function saveMap() {
@@ -1089,17 +1215,47 @@ function stopNav() {
     .finally(refreshNavStatus);
 }
 
-function mapClick(ev) {
+// Map click-mode: 'navigate' (existing NavigateToPose), 'fetch' (mission goal),
+// or 'deposit' (store deposit area). Default keeps the original behaviour.
+let mapMode = 'navigate';
+
+function setMapMode(mode) {
+  mapMode = mode;
+  ['navigate', 'fetch', 'deposit'].forEach(m => {
+    const btn = document.getElementById('mode-' + m);
+    if (btn) btn.classList.toggle('mbtn-on', m === mode);
+  });
+}
+
+function missionMsg(text, ok) {
+  const sts = document.getElementById('mission-sts');
+  if (!sts) return;
+  sts.style.color = ok ? '#3fb950' : '#f85149';
+  sts.textContent = text;
+}
+
+// Compute the /map.png pixel under a click (scaled to the image natural size).
+function clickToPixel(ev) {
   const img = document.getElementById('map-img');
-  if (!img.naturalWidth) return;
+  if (!img.naturalWidth) return null;
   const r = img.getBoundingClientRect();
-  const x = Math.round((ev.clientX - r.left) / r.width  * img.naturalWidth);
-  const y = Math.round((ev.clientY - r.top)  / r.height * img.naturalHeight);
+  return {
+    x: Math.round((ev.clientX - r.left) / r.width  * img.naturalWidth),
+    y: Math.round((ev.clientY - r.top)  / r.height * img.naturalHeight),
+  };
+}
+
+function mapClick(ev) {
+  const px = clickToPixel(ev);
+  if (!px) return;
+  if (mapMode === 'fetch')   { sendMissionGoal(px.x, px.y); return; }
+  if (mapMode === 'deposit') { setDeposit(px.x, px.y); return; }
+  // ---- navigate mode (unchanged behaviour) ----
   navMsg('Sending goal\\u2026', true);
   fetch('/navigate', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({x: x, y: y}),
+    body: JSON.stringify({x: px.x, y: px.y}),
   })
     .then(r => r.json())
     .then(d => {
@@ -1107,6 +1263,55 @@ function mapClick(ev) {
       else navMsg(d.msg || 'goal rejected', false);
     })
     .catch(() => navMsg('Request failed', false));
+}
+
+function sendMissionGoal(ix, iy) {
+  missionMsg('Sending fetch goal\\u2026', true);
+  fetch('/mission/goal', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ix: ix, iy: iy}),
+  })
+    .then(r => r.json().then(d => ({ok: r.ok, d: d})))
+    .then(({ok, d}) => {
+      if (ok && d.x !== undefined) {
+        fetchMarker = {x: d.x, y: d.y};
+        redrawOverlay();
+        missionMsg('\\u2713 Goal sent (' + d.x + ', ' + d.y + ') m', true);
+      } else {
+        missionMsg(d.msg || 'no map', false);
+      }
+    })
+    .catch(() => missionMsg('Request failed', false));
+}
+
+function setDeposit(ix, iy) {
+  missionMsg('Setting deposit area\\u2026', true);
+  fetch('/mission/deposit', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ix: ix, iy: iy}),
+  })
+    .then(r => r.json().then(d => ({ok: r.ok, d: d})))
+    .then(({ok, d}) => {
+      if (ok && d.x !== undefined) {
+        depositMarker = {x: d.x, y: d.y};
+        redrawOverlay();
+        missionMsg('\\u2713 Deposit set (' + d.x + ', ' + d.y + ') m', true);
+      } else {
+        missionMsg(d.msg || 'no map', false);
+      }
+    })
+    .catch(() => missionMsg('Request failed', false));
+}
+
+function loadDeposit() {
+  fetch('/mission/deposit')
+    .then(r => r.ok ? r.json() : null)
+    .then(d => {
+      if (d && d.x !== undefined) { depositMarker = {x: d.x, y: d.y}; redrawOverlay(); }
+    })
+    .catch(() => {});
 }
 
 // ===========================================================================
@@ -1663,6 +1868,10 @@ class WebControlNode(Node):
         # detector (jetank_detection). The web UI "Detections" toggle draws these
         # boxes over the camera stream. Stays empty when no detector is running.
         self.declare_parameter('detections_topic', '/detections/socks')
+        # Persisted deposit pose for the web map-click mission ("Set deposit
+        # area" mode). Stored as JSON {"x","y"} so it survives node restarts.
+        self.declare_parameter(
+            'deposit_file', os.path.expanduser('~/.jetank/deposit_pose.json'))
 
         self._port = self.get_parameter('web_port').value
         image_topic = self.get_parameter('image_topic').value
@@ -1713,6 +1922,16 @@ class WebControlNode(Node):
         self._nav_mode: Optional[str] = None   # 'mapping' | 'navigation' | None
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self._initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+
+        # Web map-click mission (M1): a "fetch" click publishes a goal point on
+        # /mission/goal (consumed by the mission_coordinator in M2); a "deposit"
+        # click stores a persisted deposit pose for the DEPOSIT step.
+        self._mission_goal_pub = self.create_publisher(PoseStamped, '/mission/goal', 10)
+        self._deposit_file = os.path.expanduser(
+            self.get_parameter('deposit_file').value)
+        self._deposit_lock = threading.Lock()
+        self._deposit_pose: Optional[tuple] = None   # (x, y) in the map frame
+        self._load_deposit_pose()
         # AMCL's estimated robot pose (for the web map arrow + localization status).
         self._amcl_lock = threading.Lock()
         self._amcl_pose = None
@@ -2371,12 +2590,8 @@ class WebControlNode(Node):
             ox, oy = self._map_origin
         if not meta:
             return False, 'no map yet'
-        res, w, h = meta['resolution'], meta['width'], meta['height']
-        ix = max(0, min(w - 1, int(ix)))
-        iy = max(0, min(h - 1, int(iy)))
-        grid_row = (h - 1) - iy   # the PNG was flipud'd before serving
-        wx = ox + (ix + 0.5) * res
-        wy = oy + (grid_row + 0.5) * res
+        wx, wy = map_pixel_to_world(
+            ix, iy, meta['resolution'], meta['width'], meta['height'], ox, oy)
 
         if not self._nav_client.server_is_ready():
             if not self._nav_client.wait_for_server(timeout_sec=2.0):
@@ -2404,6 +2619,92 @@ class WebControlNode(Node):
             self.get_logger().warn('NavigateToPose goal REJECTED')
             return
         self.get_logger().info('NavigateToPose goal accepted')
+
+    # ---- web map-click mission (M1) ---------------------------------------
+    def _pixel_to_world_locked(self, ix: int, iy: int):
+        """Convert a pixel to a map-frame ``(wx, wy)`` or ``None`` if no map.
+
+        Reads ``_map_meta``/``_map_origin`` under ``_map_lock`` and delegates to
+        the pure :func:`map_pixel_to_world` helper (same math as
+        :meth:`navigate_to_pixel`).
+        """
+        with self._map_lock:
+            meta = dict(self._map_meta)
+            ox, oy = self._map_origin
+        if not meta:
+            return None
+        return map_pixel_to_world(
+            ix, iy, meta['resolution'], meta['width'], meta['height'], ox, oy)
+
+    def publish_mission_goal_from_pixel(self, ix: int, iy: int) -> tuple:
+        """Convert a map pixel to a world point and publish it on /mission/goal.
+
+        Returns ``(True, {'x','y'})`` on success, ``(False, reason)`` if no map
+        is available yet. The mission_coordinator (M2) consumes the published
+        ``PoseStamped``; this node only publishes it.
+        """
+        world = self._pixel_to_world_locked(ix, iy)
+        if world is None:
+            return False, 'no map yet'
+        wx, wy = world
+        ps = PoseStamped()
+        ps.header.frame_id = 'map'
+        ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose.position.x = float(wx)
+        ps.pose.position.y = float(wy)
+        ps.pose.orientation.w = 1.0
+        self._mission_goal_pub.publish(ps)
+        self.get_logger().info(f'mission goal -> map ({wx:.2f}, {wy:.2f})')
+        return True, {'x': round(wx, 3), 'y': round(wy, 3)}
+
+    def set_deposit_from_pixel(self, ix: int, iy: int) -> tuple:
+        """Store + persist a deposit pose from a map pixel click.
+
+        Returns ``(True, {'x','y'})`` on success, ``(False, reason)`` if no map.
+        """
+        world = self._pixel_to_world_locked(ix, iy)
+        if world is None:
+            return False, 'no map yet'
+        wx, wy = world
+        with self._deposit_lock:
+            self._deposit_pose = (float(wx), float(wy))
+            self._save_deposit_pose_locked()
+        self.get_logger().info(f'deposit pose set -> map ({wx:.2f}, {wy:.2f})')
+        return True, {'x': round(wx, 3), 'y': round(wy, 3)}
+
+    def get_deposit_pose(self) -> Optional[dict]:
+        """Return the stored deposit pose as ``{'x','y'}`` or ``None`` if unset."""
+        with self._deposit_lock:
+            if self._deposit_pose is None:
+                return None
+            x, y = self._deposit_pose
+        return {'x': round(x, 3), 'y': round(y, 3)}
+
+    def _load_deposit_pose(self):
+        """Load the persisted deposit pose on start (best-effort, never raises)."""
+        try:
+            with open(self._deposit_file, 'r', encoding='utf-8') as fh:
+                parsed = deposit_parse(fh.read())
+        except (OSError, ValueError):
+            parsed = None
+        if parsed is not None:
+            self._deposit_pose = parsed
+            self.get_logger().info(
+                f'loaded deposit pose ({parsed[0]:.2f}, {parsed[1]:.2f}) '
+                f'from {self._deposit_file}')
+
+    def _save_deposit_pose_locked(self):
+        """Persist the current deposit pose to disk (call under _deposit_lock)."""
+        if self._deposit_pose is None:
+            return
+        x, y = self._deposit_pose
+        try:
+            os.makedirs(os.path.dirname(self._deposit_file) or '.', exist_ok=True)
+            with open(self._deposit_file, 'w', encoding='utf-8') as fh:
+                fh.write(deposit_serialize(x, y))
+        except OSError as exc:
+            self.get_logger().warn(
+                f'failed to persist deposit pose to {self._deposit_file}: {exc}')
 
     def apply_cmd(self, linear_x: float, angular_z: float):
         lx = max(-1.0, min(1.0, linear_x)) * self._max_linear
@@ -2554,6 +2855,39 @@ async def handle_navigate(request: web.Request) -> web.Response:
     return web.json_response({'status': 'error', 'msg': info}, status=409)
 
 
+async def handle_mission_goal(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    try:
+        data = await request.json()
+        ok, info = node.publish_mission_goal_from_pixel(
+            int(data['ix']), int(data['iy']))
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
+    if ok:
+        return web.json_response(info)
+    return web.json_response({'status': 'error', 'msg': info}, status=404)
+
+
+async def handle_set_deposit(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    try:
+        data = await request.json()
+        ok, info = node.set_deposit_from_pixel(int(data['ix']), int(data['iy']))
+    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+        return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
+    if ok:
+        return web.json_response(info)
+    return web.json_response({'status': 'error', 'msg': info}, status=404)
+
+
+async def handle_get_deposit(request: web.Request) -> web.Response:
+    node: WebControlNode = request.app['node']
+    pose = node.get_deposit_pose()
+    if pose is None:
+        return web.json_response({'set': False})
+    return web.json_response(pose)
+
+
 async def handle_capture(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     ok, info = node.save_capture()
@@ -2670,6 +3004,9 @@ def build_app(node: WebControlNode) -> web.Application:
     app.router.add_get('/nav_status', handle_nav_status)
     app.router.add_get('/robot_pose', handle_robot_pose)
     app.router.add_post('/navigate', handle_navigate)
+    app.router.add_post('/mission/goal', handle_mission_goal)
+    app.router.add_post('/mission/deposit', handle_set_deposit)
+    app.router.add_get('/mission/deposit', handle_get_deposit)
     app.router.add_post('/capture', handle_capture)
     # Label / capture endpoints
     app.router.add_get('/captures', handle_list_captures)
