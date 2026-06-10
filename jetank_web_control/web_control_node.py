@@ -2669,8 +2669,11 @@ class WebControlNode(Node):
         msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
         msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
         cov = [0.0] * 36
-        cov[0] = cov[7] = 0.25       # x, y variance
-        cov[35] = 0.0685             # yaw variance
+        # Phase 2 (localization tuning): start pose is well-known (robot spawns
+        # at the seeded pose), so seed a tight covariance — a loose seed let the
+        # filter wander into a wrong-heading basin.
+        cov[0] = cov[7] = 0.04       # x, y variance
+        cov[35] = 0.02               # yaw variance
         msg.pose.covariance = cov
         # Keep re-publishing until AMCL actually converges near the seed. A single
         # early publish is lost because AMCL is not subscribed yet during bringup
