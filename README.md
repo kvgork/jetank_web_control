@@ -221,19 +221,61 @@ the streamed camera should share resolution (they do in sim — both
 `/stereo_camera/left/image_raw`).
 
 **Velocity muxing:** the web teleop publishes `/cmd_vel_teleop` and Nav2 publishes
-`/cmd_vel`; `cmd_vel_bridge` muxes them (teleop wins only while actively non-zero)
-and republishes `TwistStamped` to `/diff_drive_controller/cmd_vel`. This stops the
-teleop watchdog's idle zeros and Nav2 from fighting over one topic.
+`/cmd_vel`; `cmd_vel_bridge` muxes them (teleop wins only while actively non-zero,
+otherwise fresh non-zero Nav2 passes through) and republishes `TwistStamped` to
+`/diff_drive_controller/cmd_vel`. This stops the teleop watchdog's idle zeros and
+Nav2 from fighting over one topic.
+
+**Silent-when-idle (don't flood zeros).** When neither source is driving, the
+bridge emits a brief zero burst (~0.3 s) to brake cleanly, then **goes silent**
+instead of streaming zero-Twists forever. This is deliberate: during a grasp's
+APPROACH a *third* publisher — `base_approach` — drives `/diff_drive_controller/cmd_vel`
+directly to creep the base onto the sock. A continuous idle-zero stream from the
+bridge interleaves with those commands at the controller and cancels the motion
+(the base stutters in place → APPROACH times out → the fetch mission fails). Going
+silent lets `base_approach` own the topic; the `diff_drive_controller`'s own
+`cmd_vel_timeout` keeps the base stopped once every publisher is quiet.
 
 **Notes / known limits:**
 - **Saved-map mode needs a map that matches the live world** and the robot to start
   at the seeded pose (`initial_pose_*` params, default origin). AMCL is seeded via
-  `/initialpose` (re-published until it converges). If the robot starts elsewhere,
-  localization will be wrong — a "click to set pose" control is a future addition.
+  `/initialpose` (re-published until it converges) with a **tight seed covariance**
+  (x/y variance 0.04, yaw 0.02) — we trust the start pose, so a loose seed let the
+  particle cloud wander and mis-localize. If the robot starts elsewhere, localization
+  will be wrong — a "click to set pose" control is a future addition.
 - The **Start Mapping** path is the most robust for navigation (slam_toolbox gives
   continuous localization, no AMCL init/lifecycle fragility).
 - Costmap `inflation_radius` (0.18) / `robot_radius` (0.12) are tuned for the small
   JeTank; adjust in `jetank_navigation/config/nav2/nav2_params.yaml`.
+
+### Fetch missions from the map (click-to-fetch)
+
+When `jetank_mission` is built, the map gains two extra click modes alongside the
+plain **navigate** click (toggle with the map-mode buttons):
+
+- **Fetch** — click the map to start a fetch mission *at that point*. The pixel is
+  converted to a map-frame goal (see below) and sent as a `RunMission` goal to the
+  `mission_coordinator` (`/mission_coordinator/run_mission`). The coordinator drives
+  there, searches/grasps a sock, and returns it to the deposit area. A green marker
+  is drawn at the fetch goal.
+- **Set deposit area** — click the map to store the **deposit pose** (where fetched
+  socks are dropped). It is persisted to `~/.jetank/deposit_pose.json` (param
+  `deposit_file`) so it survives restarts, and shown as a purple marker.
+
+Live status (`NAVIGATE_TO_SITE → SEARCH → APPROACH → GRASP → … → DONE/FAILED`) is
+polled from `/mission/status` and shown next to the buttons; **Cancel mission**
+cancels the in-flight goal. If `jetank_mission` isn't present the action client is
+absent and Fetch reports `mission_unavailable` (deposit-set still works).
+
+**Map pixel → world point** (shared by navigate/fetch/deposit, `map_pixel_to_world`):
+the served `/map.png` is vertically flipped (`np.flipud`), so the grid row is
+recovered as `grid_row = (height-1) - iy`, then the cell-centre point is
+`wx = origin_x + (ix+0.5)*resolution`, `wy = origin_y + (grid_row+0.5)*resolution`.
+Pixels are clamped to the map bounds (out-of-range clicks snap to the nearest edge).
+
+Endpoints: `POST /mission/goal {ix,iy}` (start fetch),
+`GET /mission/status` (`{status,active}`), `POST /mission/cancel`,
+`POST /mission/deposit {ix,iy}` / `GET /mission/deposit` (`{x,y}` or `{set:false}`).
 
 ### 4. Open the controller
 
@@ -312,21 +354,22 @@ ros2 launch jetank_web_control web_control.launch.py \
 
 ## ROS 2 API
 
-`jetank_web_control` (ament_python) runs a browser-based teleop/streaming server and a sim cmd_vel mux. The browser-facing HTTP/WebSocket endpoints (e.g. `/`, `/stream.mjpg`, `/ws`, `/map.png`, `/capture`, `/captures/*`, `/navigate`, `/grab`) are **not** ROS interfaces and are not listed here; only the ROS 2 wire API is documented below.
+`jetank_web_control` (ament_python) runs a browser-based teleop/streaming server and a sim cmd_vel mux. The browser-facing HTTP/WebSocket endpoints (e.g. `/`, `/stream.mjpg`, `/ws`, `/map.png`, `/capture`, `/captures/*`, `/navigate`, `/mission/*`, `/grab`) are **not** ROS interfaces and are not listed here; only the ROS 2 wire API is documented below.
 
 ### Nodes
 
 | Node | Executable | Role |
 |------|-----------|------|
 | `web_control_node` | `web_control_node` | HTTP/WebSocket server: streams the left camera, publishes teleop `cmd_vel`, drives Nav2 (NavigateToPose) + optional grasp (GraspObject), serves the live map and capture/label dataset tools. |
-| `cmd_vel_bridge` | `cmd_vel_bridge` | Sim-only mux: combines web-teleop + Nav2 `Twist` streams (teleop priority) and republishes `TwistStamped` for Gazebo's diff_drive_controller. Launched only when `sim:=true`. |
+| `cmd_vel_bridge` | `cmd_vel_bridge` | Sim-only mux: combines web-teleop + Nav2 `Twist` streams (teleop priority) and republishes `TwistStamped` for Gazebo's diff_drive_controller. **Goes silent when idle** (brief stop-burst, then quiet) so a third direct publisher (`base_approach`) can own the output topic during a grasp. Launched only when `sim:=true`. |
 
 ### Published topics
 
 | Topic | Type | Node |
 |-------|------|------|
 | `/cmd_vel` (param `cmd_vel_topic`; remapped to `/cmd_vel_teleop` when `sim:=true`) | `geometry_msgs/Twist` | `web_control_node` |
-| `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | `web_control_node` |
+| `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | `web_control_node` (tight AMCL seed covariance) |
+| `/mission/goal` | `geometry_msgs/PoseStamped` | `web_control_node` (debug echo of the Fetch goal point) |
 | `/diff_drive_controller/cmd_vel` (param `output_topic`) | `geometry_msgs/TwistStamped` | `cmd_vel_bridge` |
 
 ### Subscribed topics
@@ -338,6 +381,7 @@ ros2 launch jetank_web_control web_control.launch.py \
 | `/map` | `nav_msgs/OccupancyGrid` | `web_control_node` |
 | `/amcl_pose` | `geometry_msgs/PoseWithCovarianceStamped` | `web_control_node` |
 | `/detections/socks` (param `detections_topic`) | `vision_msgs/Detection2DArray` | `web_control_node` |
+| `/mission/status` | `std_msgs/String` | `web_control_node` (cached for `GET /mission/status`) |
 | `/cmd_vel_teleop` (param `teleop_topic`) | `geometry_msgs/Twist` | `cmd_vel_bridge` |
 | `/cmd_vel` (param `nav_topic`) | `geometry_msgs/Twist` | `cmd_vel_bridge` |
 
@@ -346,6 +390,7 @@ ros2 launch jetank_web_control web_control.launch.py \
 | Action | Type | Role |
 |--------|------|------|
 | `/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | `web_control_node` client — click-to-navigate goals. |
+| `/mission_coordinator/run_mission` | `jetank_mission/action/RunMission` | `web_control_node` client — map-click **Fetch** goal. Optional: created only if `jetank_mission` is importable; otherwise Fetch reports `mission_unavailable`. |
 | `/grasp_object` | `jetank_manipulation/action/GraspObject` | `web_control_node` client — Grab button. Optional: created only if `jetank_manipulation` is importable; otherwise the Grab button is disabled. |
 
 This package defines no `action/`, `srv/`, or `msg/` interfaces of its own.
@@ -370,6 +415,7 @@ This package defines no `action/`, `srv/`, or `msg/` interfaces of its own.
 | `capture_dir` | `~/datasets/detection` | Directory for captured JPEGs + YOLO labels. |
 | `capture_classes` | `['object']` | Initial class list seeded into `classes.txt`. |
 | `detections_topic` | `/detections/socks` | `Detection2DArray` topic for the live overlay. |
+| `deposit_file` | `~/.jetank/deposit_pose.json` | Where the map-click deposit pose is persisted. |
 
 #### `cmd_vel_bridge`
 

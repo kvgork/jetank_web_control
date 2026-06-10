@@ -56,6 +56,16 @@ class CmdVelBridge(Node):
         self._teleop_t = -1e9
         self._nav = None
         self._nav_t = -1e9
+        # When no fresh source is driving, emit a short zero burst to guarantee a
+        # clean stop, then go SILENT instead of flooding zeros forever. A third
+        # node (base_approach, during a grasp APPROACH) publishes drive commands
+        # directly to output_topic; a continuous idle-zero stream from this bridge
+        # interleaves with those at the controller and cancels the motion (the base
+        # stutters in place -> APPROACH times out -> every fetch mission fails).
+        # Going silent lets base_approach own the topic; the diff_drive_controller's
+        # own cmd_vel_timeout keeps the base stopped once every publisher is quiet.
+        self._stop_burst_ticks = max(1, int(round(0.3 * rate)))
+        self._stop_burst = 0
 
         self._pub = self.create_publisher(TwistStamped, out_topic, 10)
         self.create_subscription(Twist, teleop_topic, self._on_teleop, 10)
@@ -78,13 +88,22 @@ class CmdVelBridge(Node):
 
     def _tick(self):
         now = self._now()
-        out = Twist()  # default zero (stop)
         teleop_fresh = self._teleop is not None and (now - self._teleop_t) < self._teleop_timeout
         nav_fresh = self._nav is not None and (now - self._nav_t) < self._nav_timeout
+        out = None
         if teleop_fresh and _is_nonzero(self._teleop):
             out = self._teleop          # active manual driving wins
-        elif nav_fresh:
+        elif nav_fresh and _is_nonzero(self._nav):
             out = self._nav             # otherwise let Nav2 drive
+        if out is not None:
+            self._stop_burst = self._stop_burst_ticks  # arm a stop burst for idle
+        else:
+            # No fresh nonzero source. Emit a brief zero burst to brake, then stay
+            # silent so base_approach can drive the base directly (see __init__).
+            if self._stop_burst <= 0:
+                return
+            self._stop_burst -= 1
+            out = Twist()
         stamped = TwistStamped()
         stamped.header.stamp = self.get_clock().now().to_msg()
         stamped.header.frame_id = self._frame_id
