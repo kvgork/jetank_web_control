@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
-"""cmd_vel mux + Twist->TwistStamped bridge for simulation.
+"""cmd_vel mux + Twist/TwistStamped bridge for simulation and hardware.
 
-Two sources want to drive the robot:
-  - the web UI teleop (joystick / WASD)  -> a Twist on `teleop_topic`
-  - Nav2 (click-to-navigate)             -> a Twist on `nav_topic`
+Three sources want to drive the robot (in priority order, highest first):
+  - manip (base_approach / mission_coordinator) -> TwistStamped on `manip_topic`
+  - web UI teleop (joystick / WASD)             -> Twist on `teleop_topic`
+  - Nav2 (click-to-navigate)                    -> Twist on `nav_topic`
 
-Both used to publish the same `/cmd_vel`, so Nav2's idle zero-velocity stream
-(~20 Hz) drowned the web teleop and the robot would not move manually. This node
-muxes them with teleop priority and republishes the result as a TwistStamped on
-`output_topic`, which is what Gazebo's diff_drive_controller subscribes to.
+All three used to share the same topic, causing priority conflicts and idle
+zero-velocity floods.  This node muxes them and republishes the winner.
 
-Priority: while the web teleop is sending a fresh *non-zero* command it wins;
-otherwise Nav2's command passes through; otherwise zero (stop).
+Priority: manip (if fresh) > teleop (if fresh & nonzero) > nav (if fresh &
+nonzero & subscribed) > silent.  When no source is active the node goes silent
+after a short zero-burst to guarantee a clean stop (see idle-silence comment).
+
+Simulation (output_stamped=True, default):
+  Output is TwistStamped on /diff_drive_controller/cmd_vel — unchanged from
+  the original behaviour.
+
+Hardware (output_stamped=False):
+  Output is plain Twist on output_topic (e.g. /cmd_vel for the motor driver).
+  nav_topic should be set to '' on hardware (Nav2 already owns /cmd_vel via
+  its velocity_smoother; the arbiter must NOT double-publish there).
+  manip_topic set to /cmd_vel_manip (highest priority, base_approach and
+  mission_coordinator write here during SEARCH/APPROACH).
+
+Empty-topic guard: topics set to '' are NOT subscribed.  This prevents the
+arbiter from subscribing to its own output topic and creating a feedback loop,
+and disables nav on hardware where Nav2 is the sole nav publisher.
 
 Parameters:
-  teleop_topic   (str)   default '/cmd_vel_teleop'   (Twist in, web UI)
-  nav_topic      (str)   default '/cmd_vel'          (Twist in, Nav2)
-  output_topic   (str)   default '/diff_drive_controller/cmd_vel' (TwistStamped)
+  teleop_topic   (str)   default '/cmd_vel_teleop'              (Twist in, web UI)
+  nav_topic      (str)   default '/cmd_vel'                     (Twist in, Nav2)
+                          set to '' to disable (no subscription created)
+  output_topic   (str)   default '/diff_drive_controller/cmd_vel'
   frame_id       (str)   default 'base_link'
   rate_hz        (float) default 20.0
   teleop_timeout (float) default 0.4   (s; teleop considered stale after this)
   nav_timeout    (float) default 0.5   (s; nav considered stale after this)
+  output_stamped (bool)  default True  True -> TwistStamped out (sim); False -> Twist out (HW)
+  manip_topic    (str)   default ''    TwistStamped in from base_approach/mission_coordinator;
+                          '' => disabled (no subscription created).  Highest priority.
+  manip_timeout  (float) default 0.5   (s; manip considered stale after this)
 """
 
 import rclpy
@@ -43,6 +63,10 @@ class CmdVelBridge(Node):
         self.declare_parameter('rate_hz', 20.0)
         self.declare_parameter('teleop_timeout', 0.4)
         self.declare_parameter('nav_timeout', 0.5)
+        # New params (Phase 1 — FROZEN contract with Phase 2)
+        self.declare_parameter('output_stamped', True)
+        self.declare_parameter('manip_topic', '')
+        self.declare_parameter('manip_timeout', 0.5)
 
         teleop_topic = self.get_parameter('teleop_topic').value
         nav_topic = self.get_parameter('nav_topic').value
@@ -51,11 +75,19 @@ class CmdVelBridge(Node):
         rate = float(self.get_parameter('rate_hz').value)
         self._teleop_timeout = float(self.get_parameter('teleop_timeout').value)
         self._nav_timeout = float(self.get_parameter('nav_timeout').value)
+        self._output_stamped = bool(self.get_parameter('output_stamped').value)
+        manip_topic = self.get_parameter('manip_topic').value
+        self._manip_timeout = float(self.get_parameter('manip_timeout').value)
 
+        # Source state: message + timestamp of last received message
         self._teleop = None
         self._teleop_t = -1e9
         self._nav = None
         self._nav_t = -1e9
+        self._manip = None           # TwistStamped (highest priority)
+        self._manip_t = -1e9
+        self._nav_subscribed = False  # tracks whether the nav sub was created
+
         # When no fresh source is driving, emit a short zero burst to guarantee a
         # clean stop, then go SILENT instead of flooding zeros forever. A third
         # node (base_approach, during a grasp APPROACH) publishes drive commands
@@ -67,13 +99,30 @@ class CmdVelBridge(Node):
         self._stop_burst_ticks = max(1, int(round(0.3 * rate)))
         self._stop_burst = 0
 
-        self._pub = self.create_publisher(TwistStamped, out_topic, 10)
+        # Publisher: TwistStamped (sim) or Twist (hardware) depending on output_stamped
+        if self._output_stamped:
+            self._pub = self.create_publisher(TwistStamped, out_topic, 10)
+        else:
+            self._pub = self.create_publisher(Twist, out_topic, 10)
+
+        # Subscriptions — empty-topic guard: only subscribe when topic is non-empty
         self.create_subscription(Twist, teleop_topic, self._on_teleop, 10)
-        self.create_subscription(Twist, nav_topic, self._on_nav, 10)
+
+        if nav_topic:
+            self.create_subscription(Twist, nav_topic, self._on_nav, 10)
+            self._nav_subscribed = True
+
+        if manip_topic:
+            self.create_subscription(
+                TwistStamped, manip_topic, self._on_manip, 10)
+
         self.create_timer(1.0 / rate, self._tick)
+
+        out_type = 'TwistStamped' if self._output_stamped else 'Twist'
         self.get_logger().info(
-            f'cmd_vel mux: teleop[{teleop_topic}] + nav[{nav_topic}] '
-            f'-> {out_topic} (TwistStamped, teleop priority)')
+            f'cmd_vel mux: manip[{manip_topic or "disabled"}] + '
+            f'teleop[{teleop_topic}] + nav[{nav_topic or "disabled"}] '
+            f'-> {out_topic} ({out_type}, manip>teleop>nav priority)')
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
@@ -86,15 +135,41 @@ class CmdVelBridge(Node):
         self._nav = msg
         self._nav_t = self._now()
 
+    def _on_manip(self, msg: TwistStamped):
+        # Store only the twist part for uniform handling; freshness tracked separately
+        self._manip = msg.twist
+        self._manip_t = self._now()
+
+    def _select_command(self, now: float):
+        """Pure selection logic — returns (chosen_twist_or_None, any_active).
+
+        Returns the winning Twist (or None if all sources are idle/stale).
+        This is a pure function of state, extracted for testability.
+
+        Priority: manip > teleop (nonzero) > nav (nonzero, if subscribed) > None.
+        Manip wins whenever it is fresh, regardless of whether the twist is zero
+        (it owns the base during approach; a zero manip means "stop the base").
+        """
+        manip_fresh = (self._manip is not None
+                       and (now - self._manip_t) < self._manip_timeout)
+        teleop_fresh = (self._teleop is not None
+                        and (now - self._teleop_t) < self._teleop_timeout)
+        nav_fresh = (self._nav_subscribed
+                     and self._nav is not None
+                     and (now - self._nav_t) < self._nav_timeout)
+
+        if manip_fresh:
+            return self._manip         # highest priority — owns base during APPROACH
+        if teleop_fresh and _is_nonzero(self._teleop):
+            return self._teleop        # active manual driving
+        if nav_fresh and _is_nonzero(self._nav):
+            return self._nav           # let Nav2 drive
+        return None                    # all sources idle / stale
+
     def _tick(self):
         now = self._now()
-        teleop_fresh = self._teleop is not None and (now - self._teleop_t) < self._teleop_timeout
-        nav_fresh = self._nav is not None and (now - self._nav_t) < self._nav_timeout
-        out = None
-        if teleop_fresh and _is_nonzero(self._teleop):
-            out = self._teleop          # active manual driving wins
-        elif nav_fresh and _is_nonzero(self._nav):
-            out = self._nav             # otherwise let Nav2 drive
+        out = self._select_command(now)
+
         if out is not None:
             self._stop_burst = self._stop_burst_ticks  # arm a stop burst for idle
         else:
@@ -104,11 +179,15 @@ class CmdVelBridge(Node):
                 return
             self._stop_burst -= 1
             out = Twist()
-        stamped = TwistStamped()
-        stamped.header.stamp = self.get_clock().now().to_msg()
-        stamped.header.frame_id = self._frame_id
-        stamped.twist = out
-        self._pub.publish(stamped)
+
+        if self._output_stamped:
+            stamped = TwistStamped()
+            stamped.header.stamp = self.get_clock().now().to_msg()
+            stamped.header.frame_id = self._frame_id
+            stamped.twist = out
+            self._pub.publish(stamped)
+        else:
+            self._pub.publish(out)
 
 
 def main(args=None):

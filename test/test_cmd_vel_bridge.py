@@ -1,18 +1,18 @@
 """
-Pure-logic tests for the cmd_vel mux/bridge and the web node's twist math.
+Pure-logic tests for the extended cmd_vel mux/bridge.
 
-These import the package's *real* modules and exercise their actual logic:
+Tests cover:
+  (a) _is_nonzero dead-band helper
+  (b) _select_command priority: manip > teleop > nav
+  (c) staleness / timeout fall-through to next source
+  (d) silence when all sources idle (None returned)
+  (e) output type: TwistStamped when output_stamped=True, Twist when False
+  (f) empty manip_topic / nav_topic => no subscription created
+  (g) WebControlNode.apply_cmd math (preserved from original suite)
 
-  * ``cmd_vel_bridge._is_nonzero`` — the 1e-3 dead-band threshold.
-  * ``cmd_vel_bridge.CmdVelBridge._tick`` — the teleop-priority mux decision
-    (active teleop wins; else fresh nav; else zero), run against a fake ``self``
-    so no ROS context / timers are needed.
-  * ``web_control_node.WebControlNode.apply_cmd`` — the [-1, 1] clamp then
-    per-axis max-speed scaling, run against a fake ``self``.
-
-Import strategy mirrors test_labels.py: stub rclpy / geometry_msgs only if the
-real packages are unavailable (a bare env), so the module is importable either
-way without ever calling rclpy.init().
+No ROS spin, no hardware.  ROS / geometry_msgs packages are stubbed when
+unavailable (bare env) using the same pattern as the other test files in this
+package.
 """
 
 import importlib
@@ -122,6 +122,7 @@ try:
     _is_nonzero = _bridge._is_nonzero
     CmdVelBridge = _bridge.CmdVelBridge
     Twist = sys.modules['geometry_msgs.msg'].Twist
+    TwistStamped = sys.modules['geometry_msgs.msg'].TwistStamped
 except Exception as exc:  # pragma: no cover
     pytest.skip(f'Could not import cmd_vel_bridge: {exc}', allow_module_level=True)
 
@@ -132,12 +133,108 @@ except Exception:  # pragma: no cover
     WebControlNode = None
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
 def _twist(lx=0.0, ly=0.0, az=0.0):
     t = Twist()
     t.linear.x = lx
     t.linear.y = ly
     t.angular.z = az
     return t
+
+
+def _make_stamp():
+    """Return a value assignable to a TwistStamped header.stamp."""
+    try:
+        from builtin_interfaces.msg import Time
+        return Time()
+    except ImportError:
+        return object()
+
+
+class _FakeClock:
+    class _Now:
+        def to_msg(self):
+            return _make_stamp()
+
+        @property
+        def nanoseconds(self):
+            return 0
+
+    def now(self):
+        return self._Now()
+
+
+# ---------------------------------------------------------------------------
+# Fake node for _select_command + _tick tests
+# ---------------------------------------------------------------------------
+
+class _FakeBridge:
+    """Carries exactly the attributes CmdVelBridge._select_command and _tick
+    read/write.  Mirrors the instance variables set in CmdVelBridge.__init__.
+
+    Includes a _select_command delegation so that _tick (called as an unbound
+    method on this fake) can call self._select_command(now) and reach the real
+    implementation.
+    """
+
+    def __init__(self, now,
+                 teleop=None, teleop_t=-1e9,
+                 nav=None, nav_t=-1e9,
+                 manip=None, manip_t=-1e9,
+                 teleop_timeout=0.4, nav_timeout=0.5, manip_timeout=0.5,
+                 nav_subscribed=True, output_stamped=True,
+                 frame_id='base_link'):
+        self._now_val = now
+        self._teleop = teleop
+        self._teleop_t = teleop_t
+        self._nav = nav
+        self._nav_t = nav_t
+        self._manip = manip
+        self._manip_t = manip_t
+        self._teleop_timeout = teleop_timeout
+        self._nav_timeout = nav_timeout
+        self._manip_timeout = manip_timeout
+        self._nav_subscribed = nav_subscribed
+        self._output_stamped = output_stamped
+        self._frame_id = frame_id
+        self._stop_burst_ticks = 6   # 0.3 s * 20 Hz
+        self._stop_burst = 0
+        self.published = None        # last message given to _pub.publish()
+
+    def _now(self):
+        return self._now_val
+
+    def _select_command(self, now):
+        # Delegate to the real implementation so _tick can call self._select_command.
+        return CmdVelBridge._select_command(self, now)
+
+    def get_clock(self):
+        return _FakeClock()
+
+    class _Pub:
+        def __init__(self, outer):
+            self._outer = outer
+
+        def publish(self, msg):
+            self._outer.published = msg
+
+    @property
+    def _pub(self):
+        return self._Pub(self)
+
+
+def _select(fake):
+    """Call the real unbound _select_command against our fake self."""
+    return CmdVelBridge._select_command(fake, fake._now_val)
+
+
+def _run_tick(fake):
+    """Call the real unbound _tick against our fake self."""
+    CmdVelBridge._tick(fake)
+    return fake.published
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +258,6 @@ class TestIsNonzero:
         assert _is_nonzero(_twist(lx=-0.5)) is True
 
     def test_just_below_threshold_is_zero(self):
-        # 1e-3 is the strict boundary: abs > 1e-3 required.
         assert _is_nonzero(_twist(lx=1e-3, ly=1e-3, az=1e-3)) is False
 
     def test_just_above_threshold_is_nonzero(self):
@@ -172,115 +268,269 @@ class TestIsNonzero:
 
 
 # ---------------------------------------------------------------------------
-# CmdVelBridge._tick: teleop-priority mux decision (run on a fake self)
+# _select_command: priority manip > teleop > nav, staleness, silence
 # ---------------------------------------------------------------------------
 
-def _make_stamp():
-    """Return a value assignable to a TwistStamped header.stamp.
+class TestSelectCommandPriority:
+    """(a) Priority ordering."""
 
-    Uses a real builtin_interfaces Time when ROS is installed (the real message
-    type validates the field); falls back to a plain object for the bare-env
-    stub, whose header.stamp accepts anything.
-    """
-    try:
-        from builtin_interfaces.msg import Time
-        return Time()
-    except ImportError:
-        return object()
-
-
-class _FakeClock:
-    class _Now:
-        def to_msg(self):
-            return _make_stamp()
-
-    def now(self):
-        return self._Now()
-
-
-class _FakeBridge:
-    """Carries exactly the attributes CmdVelBridge._tick reads/writes."""
-
-    def __init__(self, now, teleop=None, teleop_t=-1e9, nav=None, nav_t=-1e9,
-                 teleop_timeout=0.4, nav_timeout=0.5):
-        self._now_val = now
-        self._teleop = teleop
-        self._teleop_t = teleop_t
-        self._nav = nav
-        self._nav_t = nav_t
-        self._teleop_timeout = teleop_timeout
-        self._nav_timeout = nav_timeout
-        self._frame_id = 'base_link'
-        self.published = None
-
-    def _now(self):
-        return self._now_val
-
-    def get_clock(self):
-        return _FakeClock()
-
-    class _Pub:
-        def __init__(self, outer):
-            self._outer = outer
-
-        def publish(self, stamped):
-            self._outer.published = stamped
-
-    @property
-    def _pub(self):
-        return self._Pub(self)
-
-
-def _run_tick(fake):
-    # Invoke the real, unbound _tick against our fake self.
-    CmdVelBridge._tick(fake)
-    return fake.published.twist
-
-
-class TestTickMux:
-    def test_fresh_nonzero_teleop_wins(self):
+    def test_manip_beats_teleop_and_nav(self):
+        manip = _twist(lx=1.0)
         teleop = _twist(lx=0.4)
-        nav = _twist(lx=0.1)
-        fake = _FakeBridge(now=1.0, teleop=teleop, teleop_t=0.9, nav=nav, nav_t=0.9)
-        out = _run_tick(fake)
-        assert out is teleop
+        nav = _twist(lx=0.2)
+        fake = _FakeBridge(
+            now=1.0,
+            manip=manip, manip_t=0.9,
+            teleop=teleop, teleop_t=0.9,
+            nav=nav, nav_t=0.9,
+        )
+        assert _select(fake) is manip
 
-    def test_zero_teleop_falls_through_to_nav(self):
-        # Teleop fresh but zero -> nav drives.
-        nav = _twist(lx=0.1)
-        fake = _FakeBridge(now=1.0, teleop=_twist(), teleop_t=0.9, nav=nav, nav_t=0.9)
-        out = _run_tick(fake)
-        assert out is nav
+    def test_teleop_beats_nav_when_manip_absent(self):
+        teleop = _twist(lx=0.4)
+        nav = _twist(lx=0.2)
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=teleop, teleop_t=0.9,
+            nav=nav, nav_t=0.9,
+        )
+        assert _select(fake) is teleop
+
+    def test_nav_wins_when_teleop_zero_manip_absent(self):
+        nav = _twist(lx=0.2)
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=_twist(), teleop_t=0.9,   # fresh but zero
+            nav=nav, nav_t=0.9,
+        )
+        assert _select(fake) is nav
+
+    def test_manip_zero_still_wins_over_teleop(self):
+        """Manip zero means 'stop base' (e.g. end of approach); it still wins."""
+        manip_zero = _twist()
+        teleop = _twist(lx=0.5)
+        fake = _FakeBridge(
+            now=1.0,
+            manip=manip_zero, manip_t=0.9,
+            teleop=teleop, teleop_t=0.9,
+        )
+        assert _select(fake) is manip_zero
+
+
+class TestSelectCommandStaleness:
+    """(b) Timeout fall-through to next source."""
+
+    def test_stale_manip_falls_through_to_teleop(self):
+        manip = _twist(lx=1.0)
+        teleop = _twist(lx=0.4)
+        fake = _FakeBridge(
+            now=2.0,
+            manip=manip, manip_t=1.0,    # 1.0 s ago > 0.5 timeout -> stale
+            teleop=teleop, teleop_t=1.9,  # fresh
+        )
+        assert _select(fake) is teleop
 
     def test_stale_teleop_falls_through_to_nav(self):
         teleop = _twist(lx=0.4)
         nav = _twist(lx=0.1)
-        # teleop is 0.6s old (> 0.4 timeout) so it is ignored; nav is fresh.
-        fake = _FakeBridge(now=1.0, teleop=teleop, teleop_t=0.4, nav=nav, nav_t=0.9)
-        out = _run_tick(fake)
-        assert out is nav
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=teleop, teleop_t=0.4,  # 0.6 s ago > 0.4 timeout -> stale
+            nav=nav, nav_t=0.9,
+        )
+        assert _select(fake) is nav
 
-    def test_everything_stale_outputs_zero(self):
-        teleop = _twist(lx=0.4)
+    def test_stale_nav_returns_none(self):
         nav = _twist(lx=0.1)
-        fake = _FakeBridge(now=10.0, teleop=teleop, teleop_t=0.0, nav=nav, nav_t=0.0)
-        out = _run_tick(fake)
-        assert out.linear.x == 0.0 and out.angular.z == 0.0
-        assert out is not teleop and out is not nav
+        fake = _FakeBridge(
+            now=10.0,
+            nav=nav, nav_t=0.0,          # 10 s ago > 0.5 timeout -> stale
+        )
+        assert _select(fake) is None
 
-    def test_no_inputs_outputs_zero(self):
+    def test_all_sources_stale_returns_none(self):
+        fake = _FakeBridge(
+            now=100.0,
+            manip=_twist(lx=1.0), manip_t=0.0,
+            teleop=_twist(lx=0.4), teleop_t=0.0,
+            nav=_twist(lx=0.1), nav_t=0.0,
+        )
+        assert _select(fake) is None
+
+
+class TestSelectCommandSilence:
+    """(c) Silence when all sources idle."""
+
+    def test_no_inputs_returns_none(self):
         fake = _FakeBridge(now=1.0)
-        out = _run_tick(fake)
-        assert out.linear.x == 0.0 and out.angular.z == 0.0
+        assert _select(fake) is None
 
-    def test_stamped_carries_frame_id(self):
-        fake = _FakeBridge(now=1.0, teleop=_twist(lx=0.4), teleop_t=0.9)
-        _run_tick(fake)
-        assert fake.published.header.frame_id == 'base_link'
+    def test_nav_not_subscribed_blocks_nav(self):
+        nav = _twist(lx=0.2)
+        fake = _FakeBridge(
+            now=1.0,
+            nav=nav, nav_t=0.9,
+            nav_subscribed=False,         # empty nav_topic -> guard active
+        )
+        assert _select(fake) is None
+
+    def test_all_zero_returns_none(self):
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=_twist(), teleop_t=0.9,
+            nav=_twist(), nav_t=0.9,
+        )
+        assert _select(fake) is None
 
 
 # ---------------------------------------------------------------------------
-# WebControlNode.apply_cmd: clamp to [-1, 1] then scale by per-axis max speed
+# _tick: output type controlled by output_stamped  (d)
+# ---------------------------------------------------------------------------
+
+class TestTickOutputType:
+    """(d) output_stamped=True -> TwistStamped; False -> plain Twist."""
+
+    def test_output_stamped_true_publishes_twiststamped(self):
+        teleop = _twist(lx=0.4)
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=teleop, teleop_t=0.9,
+            output_stamped=True,
+        )
+        result = _run_tick(fake)
+        assert result is not None
+        # TwistStamped has a .header attribute; plain Twist does not
+        assert hasattr(result, 'header'), \
+            f'Expected TwistStamped (has .header), got {type(result)}'
+        assert hasattr(result, 'twist')
+        assert result.twist is teleop
+
+    def test_output_stamped_false_publishes_plain_twist(self):
+        teleop = _twist(lx=0.4)
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=teleop, teleop_t=0.9,
+            output_stamped=False,
+        )
+        result = _run_tick(fake)
+        assert result is not None
+        # Plain Twist has .linear / .angular but NO .header
+        assert not hasattr(result, 'header'), \
+            f'Expected plain Twist (no .header), got {type(result)}'
+        assert result is teleop
+
+    def test_stamped_output_carries_frame_id(self):
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=_twist(lx=0.4), teleop_t=0.9,
+            output_stamped=True,
+            frame_id='base_link',
+        )
+        result = _run_tick(fake)
+        assert result.header.frame_id == 'base_link'
+
+    def test_manip_output_stamped_true(self):
+        manip = _twist(lx=0.8)
+        fake = _FakeBridge(
+            now=1.0,
+            manip=manip, manip_t=0.9,
+            output_stamped=True,
+        )
+        result = _run_tick(fake)
+        assert hasattr(result, 'header')
+        assert result.twist is manip
+
+    def test_manip_output_stamped_false(self):
+        manip = _twist(lx=0.8)
+        fake = _FakeBridge(
+            now=1.0,
+            manip=manip, manip_t=0.9,
+            output_stamped=False,
+        )
+        result = _run_tick(fake)
+        assert not hasattr(result, 'header')
+        assert result is manip
+
+
+# ---------------------------------------------------------------------------
+# Empty-topic guard: no subscription created  (e)
+# ---------------------------------------------------------------------------
+
+class TestEmptyTopicGuard:
+    """(e) Empty manip_topic / nav_topic => nav_subscribed=False =>
+    those sources are excluded from selection.
+
+    The guard itself is in __init__ (which we cannot call without ROS), but
+    _select_command respects self._nav_subscribed for nav, and the manip path
+    simply won't have a fresh timestamp when no subscription exists.
+    We test the selection-logic side of the guard here.
+    """
+
+    def test_nav_subscribed_false_blocks_nav_even_when_fresh(self):
+        nav = _twist(lx=0.3)
+        fake = _FakeBridge(
+            now=1.0,
+            nav=nav, nav_t=0.9,
+            nav_subscribed=False,   # simulates empty nav_topic
+        )
+        assert _select(fake) is None
+
+    def test_nav_subscribed_true_allows_nav(self):
+        nav = _twist(lx=0.3)
+        fake = _FakeBridge(
+            now=1.0,
+            nav=nav, nav_t=0.9,
+            nav_subscribed=True,
+        )
+        assert _select(fake) is nav
+
+    def test_manip_never_received_gives_none(self):
+        """No manip subscription => _manip stays None => manip path inactive."""
+        fake = _FakeBridge(now=1.0)   # _manip=None, _manip_t=-1e9 by default
+        assert _select(fake) is None  # no active source
+
+    def test_only_teleop_active_when_nav_disabled(self):
+        teleop = _twist(lx=0.4)
+        fake = _FakeBridge(
+            now=1.0,
+            teleop=teleop, teleop_t=0.9,
+            nav_subscribed=False,
+        )
+        assert _select(fake) is teleop
+
+
+# ---------------------------------------------------------------------------
+# Idle-silence / stop-burst behavior (preserved from original)
+# ---------------------------------------------------------------------------
+
+class TestIdleSilence:
+    def test_idle_after_burst_returns_none_published(self):
+        """When all sources idle and stop_burst exhausted, _tick publishes nothing."""
+        fake = _FakeBridge(now=100.0)
+        fake._stop_burst = 0   # burst already spent
+        result = _run_tick(fake)
+        assert result is None
+
+    def test_stop_burst_decrements_and_publishes_zero(self):
+        """With stop_burst > 0 and all idle, _tick publishes a zero then decrements."""
+        fake = _FakeBridge(now=100.0, output_stamped=True)
+        fake._stop_burst = 3
+        result = _run_tick(fake)
+        # Must publish something (the zero-stop burst)
+        assert result is not None
+        assert fake._stop_burst == 2  # decremented by 1
+
+    def test_active_source_arms_stop_burst(self):
+        """When an active source is present, stop_burst is reset to stop_burst_ticks."""
+        teleop = _twist(lx=0.4)
+        fake = _FakeBridge(now=1.0, teleop=teleop, teleop_t=0.9, output_stamped=True)
+        fake._stop_burst = 0
+        _run_tick(fake)
+        assert fake._stop_burst == fake._stop_burst_ticks
+
+
+# ---------------------------------------------------------------------------
+# WebControlNode.apply_cmd: clamp to [-1, 1] then scale (preserved)
 # ---------------------------------------------------------------------------
 
 class _FakeLock:
@@ -326,8 +576,8 @@ class TestApplyCmdMath:
 
     def test_clamps_above_one(self):
         lx, az = self._apply(3.0, 7.0)
-        assert lx == pytest.approx(0.5)   # 1.0 * 0.5
-        assert az == pytest.approx(1.0)   # 1.0 * 1.0
+        assert lx == pytest.approx(0.5)
+        assert az == pytest.approx(1.0)
 
     def test_clamps_below_minus_one(self):
         lx, az = self._apply(-3.0, -7.0)
