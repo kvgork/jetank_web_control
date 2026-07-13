@@ -952,6 +952,26 @@ function detPoll() {
     .catch(() => {});
 }
 
+// Shared object-fit:contain letterbox geometry. The rendered content is
+// scaled by min(box/nat) and centred inside the element box; returns
+// {scale, cw, ch, left, top} (left/top in viewport coords) or null when the
+// image has no natural size yet. ALL overlay/click mappings must go through
+// this helper — a diverged copy of this math once caused a real
+// click-mapping bug (see clickToPixel).
+function containRect(img) {
+  const natW = img.naturalWidth, natH = img.naturalHeight;
+  if (!natW || !natH) return null;
+  const r = img.getBoundingClientRect();
+  const scale = Math.min(r.width / natW, r.height / natH);
+  const cw = natW * scale, ch = natH * scale;
+  return {
+    scale: scale,
+    cw: cw, ch: ch,
+    left: r.left + (r.width - cw) / 2,
+    top:  r.top  + (r.height - ch) / 2,
+  };
+}
+
 // Boxes are in source-image pixel coords; normalize against the camera frame's
 // natural size, then map onto the contained (letterboxed) image rect. The
 // server already drops stale detections, so an empty list clears the overlay.
@@ -967,13 +987,12 @@ function detDraw(boxes, age) {
                                   : (age === null ? 'no detector' : 'searching\\u2026');
 
   const natW = camImg.naturalWidth, natH = camImg.naturalHeight;
-  if (!natW || !natH || !boxes.length) return;
-  const er = camImg.getBoundingClientRect();
+  const rect = containRect(camImg);
+  if (!rect || !boxes.length) return;
   const cr = cv.getBoundingClientRect();
-  const scale = Math.min(er.width / natW, er.height / natH);
-  const dispW = natW * scale, dispH = natH * scale;
-  const ox = (er.left + (er.width - dispW) / 2) - cr.left;
-  const oy = (er.top  + (er.height - dispH) / 2) - cr.top;
+  const dispW = rect.cw, dispH = rect.ch;
+  const ox = rect.left - cr.left;
+  const oy = rect.top  - cr.top;
 
   ctx.lineWidth = 2;
   ctx.strokeStyle = '#3fb950';
@@ -1065,22 +1084,18 @@ let depositMarker = null;  // {x,y} world point of the stored deposit area
 function worldToCanvas(wx, wy) {
   const img = document.getElementById('map-img');
   const cv = document.getElementById('map-overlay');
-  if (!lastMeta || !lastMeta.resolution || !img.naturalWidth) return null;
+  if (!lastMeta || !lastMeta.resolution) return null;
   if (!cv.width || !cv.height) return null;
-  const er = img.getBoundingClientRect();
+  const rect = containRect(img);
+  if (!rect) return null;
   const cr = cv.getBoundingClientRect();
-  const natW = img.naturalWidth, natH = img.naturalHeight;
-  const scale = Math.min(er.width / natW, er.height / natH);
-  const cw = natW * scale, ch = natH * scale;
-  const contentLeft = er.left + (er.width - cw) / 2;
-  const contentTop = er.top + (er.height - ch) / 2;
   const col = (wx - lastMeta.origin_x) / lastMeta.resolution;
   const gridRow = (wy - lastMeta.origin_y) / lastMeta.resolution;
   const ix = col, iy = (lastMeta.height - 1) - gridRow;  // PNG is flipped
   return {
-    px: (contentLeft - cr.left) + ix * scale,
-    py: (contentTop - cr.top) + iy * scale,
-    scale: scale,
+    px: (rect.left - cr.left) + ix * rect.scale,
+    py: (rect.top - cr.top) + iy * rect.scale,
+    scale: rect.scale,
   };
 }
 
@@ -1285,28 +1300,23 @@ function missionMsg(text, ok) {
 // Compute the /map.png pixel under a click.
 // #map-img is object-fit:contain, so the rendered map is letterboxed inside the
 // element box (black bars on the axis where the panel is bigger than the map's
-// aspect). Map the click through the SAME geometry worldToCanvas uses — scale =
-// min(width/natW, height/natH), content centred — or only the middle band is
-// reachable on the letterboxed axis. (The old code divided by the full element
-// box, so a panel wider than the ~101x89 map made only the middle COLUMNS
-// selectable: lots of range top-to-bottom, almost none left-to-right.)
+// aspect). Map the click through the SAME containRect geometry worldToCanvas
+// uses, or only the middle band is reachable on the letterboxed axis. (The old
+// code divided by the full element box, so a panel wider than the ~101x89 map
+// made only the middle COLUMNS selectable: lots of range top-to-bottom, almost
+// none left-to-right.)
 function clickToPixel(ev) {
   const img = document.getElementById('map-img');
-  if (!img.naturalWidth) return null;
-  const r = img.getBoundingClientRect();
-  const natW = img.naturalWidth, natH = img.naturalHeight;
-  const scale = Math.min(r.width / natW, r.height / natH);
-  const cw = natW * scale, ch = natH * scale;
-  const contentLeft = (r.width - cw) / 2;
-  const contentTop  = (r.height - ch) / 2;
-  const lx = (ev.clientX - r.left) - contentLeft;
-  const ly = (ev.clientY - r.top)  - contentTop;
-  if (lx < 0 || ly < 0 || lx > cw || ly > ch) return null;  // clicked the letterbox
+  const rect = containRect(img);
+  if (!rect) return null;
+  const lx = ev.clientX - rect.left;
+  const ly = ev.clientY - rect.top;
+  if (lx < 0 || ly < 0 || lx > rect.cw || ly > rect.ch) return null;  // clicked the letterbox
   // Clamp to valid PNG indices: the rightmost/bottom edge band would otherwise
   // round up to natW/natH (one past the last cell).
   return {
-    x: Math.min(natW - 1, Math.max(0, Math.round(lx / scale))),
-    y: Math.min(natH - 1, Math.max(0, Math.round(ly / scale))),
+    x: Math.min(img.naturalWidth - 1, Math.max(0, Math.round(lx / rect.scale))),
+    y: Math.min(img.naturalHeight - 1, Math.max(0, Math.round(ly / rect.scale))),
   };
 }
 
@@ -1569,33 +1579,22 @@ function lblSelectImage(name) {
 function lblNormToCanvas(nx, ny) {
   const img = document.getElementById('lbl-img');
   const cv = document.getElementById('lbl-overlay');
-  if (!img.naturalWidth) return [0, 0];
-  const er = img.getBoundingClientRect();
+  const rect = containRect(img);
+  if (!rect) return [0, 0];
   const cr = cv.getBoundingClientRect();
-  const natW = img.naturalWidth, natH = img.naturalHeight;
-  const scale = Math.min(er.width / natW, er.height / natH);
-  const cw = natW * scale, ch = natH * scale;
-  const contentLeft = er.left + (er.width - cw) / 2;
-  const contentTop  = er.top  + (er.height - ch) / 2;
-  const px = (contentLeft - cr.left) + nx * cw;
-  const py = (contentTop  - cr.top)  + ny * ch;
-  return [px, py];
+  return [(rect.left - cr.left) + nx * rect.cw,
+          (rect.top  - cr.top)  + ny * rect.ch];
 }
 
 // Convert canvas pixel coords to normalized [0,1] (clamped).
 function lblCanvasToNorm(px, py) {
   const img = document.getElementById('lbl-img');
   const cv = document.getElementById('lbl-overlay');
-  if (!img.naturalWidth) return [0, 0];
-  const er = img.getBoundingClientRect();
+  const rect = containRect(img);
+  if (!rect) return [0, 0];
   const cr = cv.getBoundingClientRect();
-  const natW = img.naturalWidth, natH = img.naturalHeight;
-  const scale = Math.min(er.width / natW, er.height / natH);
-  const cw = natW * scale, ch = natH * scale;
-  const contentLeft = er.left + (er.width - cw) / 2;
-  const contentTop  = er.top  + (er.height - ch) / 2;
-  const nx = (px - (contentLeft - cr.left)) / cw;
-  const ny = (py - (contentTop  - cr.top))  / ch;
+  const nx = (px - (rect.left - cr.left)) / rect.cw;
+  const ny = (py - (rect.top  - cr.top))  / rect.ch;
   return [Math.max(0, Math.min(1, nx)), Math.max(0, Math.min(1, ny))];
 }
 
