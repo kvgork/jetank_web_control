@@ -2056,11 +2056,6 @@ class WebControlNode(Node):
         self._nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self._initpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
 
-        # Web map-click mission (M1): a "fetch" click publishes a goal point on
-        # /mission/goal (kept as harmless debug); a "deposit" click stores a
-        # persisted deposit pose for the DEPOSIT step.
-        self._mission_goal_pub = self.create_publisher(PoseStamped, '/mission/goal', 10)
-
         # Web map-click mission (M6): a "fetch" click sends a RunMission goal to
         # the mission_coordinator action server and tracks live status.
         self._mission_available = _MISSION_AVAILABLE
@@ -2816,8 +2811,7 @@ class WebControlNode(Node):
     def publish_mission_goal_from_pixel(self, ix: int, iy: int) -> tuple:
         """Convert a map pixel to a world point and START a fetch mission there.
 
-        Builds the ``site`` PoseStamped (map frame), publishes it on
-        ``/mission/goal`` (harmless debug, kept from M1), and sends a RunMission
+        Builds the ``site`` PoseStamped (map frame) and sends a RunMission
         goal to the mission_coordinator action server (search_timeout=0 ->
         coordinator default). Tracks the goal handle so it can be cancelled.
 
@@ -2836,8 +2830,6 @@ class WebControlNode(Node):
         ps.pose.position.x = float(wx)
         ps.pose.position.y = float(wy)
         ps.pose.orientation.w = 1.0
-        # Harmless debug publish (kept from M1).
-        self._mission_goal_pub.publish(ps)
         self.get_logger().info(f'mission goal -> map ({wx:.2f}, {wy:.2f})')
 
         info = {'x': round(wx, 3), 'y': round(wy, 3)}
