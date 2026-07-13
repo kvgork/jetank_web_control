@@ -2037,6 +2037,13 @@ class WebControlNode(Node):
 
         self._cmd_lock = threading.Lock()
         self._last_cmd_time = 0.0
+        # On command timeout, publish a short zero burst to brake and then go
+        # SILENT instead of flooding zeros at 10 Hz forever (same idle-silence
+        # pattern as cmd_vel_bridge in this package: a permanent zero stream on
+        # cmd_vel interleaves with any other publisher on the topic, e.g.
+        # base_approach driving the base during a grasp APPROACH).
+        self._stop_burst_ticks = 3   # 0.3 s at the 10 Hz watchdog rate
+        self._stop_burst = 0         # armed while commands are fresh
 
         self._map_lock = threading.Lock()
         self._latest_map_png: Optional[bytes] = None
@@ -2228,7 +2235,13 @@ class WebControlNode(Node):
     def _watchdog_cb(self):
         with self._cmd_lock:
             age = time.monotonic() - self._last_cmd_time
-        if age > self._cmd_timeout:
+        if age <= self._cmd_timeout:
+            self._stop_burst = self._stop_burst_ticks   # re-arm while driving
+            return
+        # Command stream stopped: brake with a brief zero burst, then stay
+        # silent until a new command arrives (see __init__).
+        if self._stop_burst > 0:
+            self._stop_burst -= 1
             self._publish_twist(0.0, 0.0)
 
     # ---- public API for web handlers -------------------------------------
