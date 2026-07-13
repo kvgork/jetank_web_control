@@ -2180,7 +2180,10 @@ class WebControlNode(Node):
         h, w = msg.height, msg.width
         if h == 0 or w == 0:
             return
-        arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+        # msg.data supports the buffer protocol, so frombuffer wraps it
+        # zero-copy — no bytes() materialisation of the full raw frame. The
+        # array is only read within this callback (PIL copies on save).
+        arr = np.frombuffer(msg.data, dtype=np.uint8)
         enc = msg.encoding.lower()
         try:
             if enc in ('rgb8', 'bgr8'):
@@ -2206,7 +2209,7 @@ class WebControlNode(Node):
         w, h = msg.info.width, msg.info.height
         if w == 0 or h == 0:
             return
-        data = np.frombuffer(bytes(msg.data), dtype=np.int8).reshape((h, w))
+        data = np.frombuffer(msg.data, dtype=np.int8).reshape((h, w))
         rgb = np.full((h, w, 3), 128, dtype=np.uint8)   # unknown = mid-gray
         rgb[data == 0] = [220, 220, 220]                 # free = light
         rgb[data > 0] = [20, 20, 20]                      # occupied = dark
