@@ -3085,9 +3085,14 @@ async def handle_map_meta(request: web.Request) -> web.Response:
     return web.json_response(node.get_map_meta())
 
 
+# The nav-lifecycle node methods below block for seconds (subprocess.run,
+# proc.wait, pkill + time.sleep, wait_for_server) — run them in a worker
+# thread via asyncio.to_thread so the single asyncio loop keeps servicing
+# /ws teleop and /stream.mjpg while a nav stack starts/stops.
+
 async def handle_save_map(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    ok, info = node.save_map()
+    ok, info = await asyncio.to_thread(node.save_map)
     if ok:
         return web.json_response({'status': 'ok', 'path': info})
     return web.json_response({'status': 'error', 'msg': info}, status=500)
@@ -3095,21 +3100,21 @@ async def handle_save_map(request: web.Request) -> web.Response:
 
 async def handle_start_mapping(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    ok, msg = node.start_mapping()
+    ok, msg = await asyncio.to_thread(node.start_mapping)
     return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
                              status=200 if ok else 400)
 
 
 async def handle_start_navigation(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    ok, msg = node.start_navigation()
+    ok, msg = await asyncio.to_thread(node.start_navigation)
     return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
                              status=200 if ok else 400)
 
 
 async def handle_stop_nav(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    mode = node.stop_nav()
+    mode = await asyncio.to_thread(node.stop_nav)
     return web.json_response({'status': 'ok', 'stopped': mode})
 
 
@@ -3127,7 +3132,9 @@ async def handle_navigate(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     try:
         data = await request.json()
-        ok, info = node.navigate_to_pixel(int(data['x']), int(data['y']))
+        # navigate_to_pixel may block up to 2 s in wait_for_server().
+        ok, info = await asyncio.to_thread(
+            node.navigate_to_pixel, int(data['x']), int(data['y']))
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
     if ok:
