@@ -11,111 +11,19 @@ Tests cover:
   (g) WebControlNode.apply_cmd math (preserved from original suite)
 
 No ROS spin, no hardware.  ROS / geometry_msgs packages are stubbed when
-unavailable (bare env) using the same pattern as the other test files in this
-package.
+unavailable (bare env) by the shared ``conftest.py`` (imported by pytest
+before this module), which also handles the sys.path setup.
 """
 
 import importlib
-import os
 import sys
-import types
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Stub infrastructure (only used when the real ROS packages are absent)
+# Import the modules under test (stubs installed by conftest.py)
 # ---------------------------------------------------------------------------
-
-def _make_stub(name):
-    mod = types.ModuleType(name)
-    sys.modules[name] = mod
-    return mod
-
-
-class _Vec3:
-    def __init__(self):
-        self.x = 0.0
-        self.y = 0.0
-        self.z = 0.0
-
-
-class _StubTwist:
-    """Minimal stand-in for geometry_msgs/Twist with .linear/.angular vectors."""
-
-    def __init__(self):
-        self.linear = _Vec3()
-        self.angular = _Vec3()
-
-
-class _StubHeader:
-    def __init__(self):
-        self.stamp = None
-        self.frame_id = ''
-
-
-class _StubTwistStamped:
-    """Minimal stand-in for geometry_msgs/TwistStamped (header + twist)."""
-
-    def __init__(self):
-        self.header = _StubHeader()
-        self.twist = _StubTwist()
-
-
-def _ensure_msg_attr(mod_name, *attrs):
-    mod = sys.modules.get(mod_name)
-    if mod is None:
-        return
-    for a in attrs:
-        if not hasattr(mod, a):
-            setattr(mod, a, type(a, (), {}))
-
-
-def _install_stubs():
-    """Stub ROS deps ONLY when the real packages are unavailable (bare env)."""
-    if 'rclpy' not in sys.modules:
-        try:
-            import rclpy  # noqa: F401 — prefer the real package when present
-        except ImportError:
-            rclpy_stub = _make_stub('rclpy')
-            node_stub = _make_stub('rclpy.node')
-            node_stub.Node = object
-            rclpy_stub.node = node_stub
-            action_stub = _make_stub('rclpy.action')
-            action_stub.ActionClient = object
-            rclpy_stub.action = action_stub
-
-    if 'geometry_msgs.msg' not in sys.modules:
-        try:
-            import geometry_msgs.msg  # noqa: F401 — prefer real messages
-        except ImportError:
-            _make_stub('geometry_msgs')
-            gm = _make_stub('geometry_msgs.msg')
-            gm.Twist = _StubTwist
-            gm.TwistStamped = _StubTwistStamped
-            for attr in ('PoseStamped', 'PoseWithCovarianceStamped'):
-                setattr(gm, attr, type(attr, (), {}))
-
-    for pkg in [
-        'nav_msgs', 'nav_msgs.msg',
-        'sensor_msgs', 'sensor_msgs.msg',
-        'nav2_msgs', 'nav2_msgs.action',
-        'vision_msgs', 'vision_msgs.msg',
-        'jetank_manipulation', 'jetank_manipulation.action',
-    ]:
-        if pkg not in sys.modules:
-            _make_stub(pkg)
-    _ensure_msg_attr('nav_msgs.msg', 'OccupancyGrid')
-    _ensure_msg_attr('sensor_msgs.msg', 'CompressedImage', 'Image')
-    _ensure_msg_attr('nav2_msgs.action', 'NavigateToPose')
-    _ensure_msg_attr('vision_msgs.msg', 'Detection2DArray')
-
-
-_install_stubs()
-
-_pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if _pkg_root not in sys.path:
-    sys.path.insert(0, _pkg_root)
 
 try:
     _bridge = importlib.import_module('jetank_web_control.cmd_vel_bridge')

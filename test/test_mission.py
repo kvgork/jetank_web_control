@@ -2,101 +2,23 @@
 Tests for the pure module-level mission helpers in web_control_node:
 ``map_pixel_to_world``, ``deposit_serialize`` and ``deposit_parse``.
 
-Import strategy mirrors ``test_labels.py`` / ``test_cmd_vel_bridge.py``: the
-helpers have no ROS or aiohttp dependency, so the module is imported with ROS /
-aiohttp / message packages stubbed when absent (rclpy.init() is never called at
-import time).
+Import strategy: the helpers have no ROS or aiohttp dependency, so the module
+imports without a running ROS context (rclpy.init() is never called at import
+time).  The ROS / aiohttp stubbing for bare environments and the sys.path
+setup live in the shared ``conftest.py`` (imported by pytest before this
+module).
 """
 
 import importlib
-import os
-import sys
-import types
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Stub infrastructure (same approach as test_labels.py)
+# Import the module under test (stubs installed by conftest.py)
 # ---------------------------------------------------------------------------
 
-def _make_stub(name: str) -> types.ModuleType:
-    mod = types.ModuleType(name)
-    sys.modules[name] = mod
-    return mod
-
-
-def _ensure_attr(mod_name: str, *attrs):
-    mod = sys.modules.get(mod_name)
-    if mod is None:
-        return
-    for a in attrs:
-        if not hasattr(mod, a):
-            setattr(mod, a, type(a, (), {})())
-
-
-def _install_stubs():
-    if 'rclpy' not in sys.modules:
-        try:
-            import rclpy  # noqa: F401
-        except ImportError:
-            rclpy_stub = _make_stub('rclpy')
-            node_stub = _make_stub('rclpy.node')
-            node_stub.Node = object
-            rclpy_stub.node = node_stub
-            action_stub = _make_stub('rclpy.action')
-            action_stub.ActionClient = object
-            rclpy_stub.action = action_stub
-            qos_stub = _make_stub('rclpy.qos')
-            for _q in ('DurabilityPolicy', 'HistoryPolicy', 'QoSProfile',
-                       'ReliabilityPolicy'):
-                setattr(qos_stub, _q, object)
-            rclpy_stub.qos = qos_stub
-
-    for pkg in [
-        'geometry_msgs', 'geometry_msgs.msg',
-        'nav_msgs', 'nav_msgs.msg',
-        'sensor_msgs', 'sensor_msgs.msg',
-        'nav2_msgs', 'nav2_msgs.action',
-        'vision_msgs', 'vision_msgs.msg',
-        'std_msgs', 'std_msgs.msg',
-        'jetank_manipulation', 'jetank_manipulation.action',
-        'jetank_mission', 'jetank_mission.action',
-    ]:
-        if pkg not in sys.modules:
-            _make_stub(pkg)
-
-    _ensure_attr('geometry_msgs.msg', 'Twist', 'PoseStamped',
-                 'PoseWithCovarianceStamped')
-    _ensure_attr('nav_msgs.msg', 'OccupancyGrid')
-    _ensure_attr('sensor_msgs.msg', 'CompressedImage', 'Image')
-    _ensure_attr('nav2_msgs.action', 'NavigateToPose')
-    _ensure_attr('vision_msgs.msg', 'Detection2DArray')
-    _ensure_attr('std_msgs.msg', 'String')
-
-    if 'aiohttp' not in sys.modules:
-        try:
-            import aiohttp  # noqa: F401
-        except ImportError:
-            web_stub = _make_stub('aiohttp.web')
-            web_stub.Application = object
-            web_stub.Request = object
-            web_stub.Response = object
-            web_stub.StreamResponse = object
-            web_stub.WebSocketResponse = object
-            web_stub.json_response = None
-            aio_stub = _make_stub('aiohttp')
-            aio_stub.web = web_stub
-            aio_stub.WSMsgType = type(
-                'WSMsgType', (), {'TEXT': 1, 'ERROR': 2, 'CLOSE': 3})
-
-
-_install_stubs()
-
 try:
-    pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    if pkg_root not in sys.path:
-        sys.path.insert(0, pkg_root)
     _mod = importlib.import_module('jetank_web_control.web_control_node')
     map_pixel_to_world = _mod.map_pixel_to_world
     deposit_serialize = _mod.deposit_serialize

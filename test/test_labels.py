@@ -2,110 +2,22 @@
 Tests for the pure module-level label helpers in web_control_node.
 
 Import strategy: the helpers are module-level functions with no ROS or aiohttp
-dependency, so we can import the module without a running ROS context as long as
-rclpy.init() is never called at import time.  The module imports rclpy and
-aiohttp at the top level (for the class/handler definitions), but neither
-requires init()/running instances to be *importable*.  We stub both if absent.
+dependency, so we can import the module without a running ROS context as long
+as rclpy.init() is never called at import time.  The ROS / aiohttp stubbing
+for bare environments and the sys.path setup live in the shared
+``conftest.py`` (imported by pytest before this module).
 """
 
 import importlib
-import os
-import sys
-import types
 
 import pytest
 
 
 # ---------------------------------------------------------------------------
-# Stub infrastructure
+# Import the module under test (stubs installed by conftest.py)
 # ---------------------------------------------------------------------------
-
-def _make_stub(name: str) -> types.ModuleType:
-    """Create and register a minimal stub module in sys.modules."""
-    mod = types.ModuleType(name)
-    sys.modules[name] = mod
-    return mod
-
-
-def _ensure_attr(mod_name: str, *attrs):
-    mod = sys.modules.get(mod_name)
-    if mod is None:
-        return
-    for a in attrs:
-        if not hasattr(mod, a):
-            # Create a trivial sentinel class
-            setattr(mod, a, type(a, (), {})())
-
-
-def _install_stubs():
-    """Install minimal stubs for rclpy and aiohttp if they are not present."""
-    # ---- rclpy ----
-    if 'rclpy' not in sys.modules:
-        try:
-            import rclpy  # noqa: F401 — use real package when available
-        except ImportError:
-            rclpy_stub = _make_stub('rclpy')
-            node_stub = _make_stub('rclpy.node')
-            node_stub.Node = object
-            rclpy_stub.node = node_stub
-            action_stub = _make_stub('rclpy.action')
-            action_stub.ActionClient = object
-            rclpy_stub.action = action_stub
-
-    # ---- message types ----
-    for pkg in [
-        'geometry_msgs', 'geometry_msgs.msg',
-        'nav_msgs', 'nav_msgs.msg',
-        'sensor_msgs', 'sensor_msgs.msg',
-        'nav2_msgs', 'nav2_msgs.action',
-        'vision_msgs', 'vision_msgs.msg',
-        # jetank_manipulation is imported with try/except in the module, so
-        # no stub is strictly needed; add it anyway for offline test runs.
-        'jetank_manipulation', 'jetank_manipulation.action',
-    ]:
-        if pkg not in sys.modules:
-            _make_stub(pkg)
-
-    _ensure_attr('geometry_msgs.msg', 'Twist', 'PoseStamped', 'PoseWithCovarianceStamped')
-    _ensure_attr('nav_msgs.msg', 'OccupancyGrid')
-    _ensure_attr('sensor_msgs.msg', 'CompressedImage', 'Image')
-    _ensure_attr('nav2_msgs.action', 'NavigateToPose')
-    _ensure_attr('vision_msgs.msg', 'Detection2DArray')
-
-    # ---- aiohttp ----
-    # The module does `from aiohttp import web; import aiohttp` inside a
-    # try/except ImportError block.  We need 'aiohttp' in sys.modules with a
-    # `web` attribute so the from-import succeeds.
-    if 'aiohttp' not in sys.modules:
-        try:
-            import aiohttp  # noqa: F401 — use real package when available
-        except ImportError:
-            web_stub = _make_stub('aiohttp.web')
-            web_stub.Application = object
-            web_stub.Request = object
-            web_stub.Response = object
-            web_stub.StreamResponse = object
-            web_stub.WebSocketResponse = object
-            web_stub.json_response = None
-
-            aio_stub = _make_stub('aiohttp')
-            # `from aiohttp import web` needs web as an attribute
-            aio_stub.web = web_stub
-            # `aiohttp.WSMsgType` is referenced at runtime only (not import time)
-            aio_stub.WSMsgType = type('WSMsgType', (), {'TEXT': 1, 'ERROR': 2, 'CLOSE': 3})
-
-
-# ---------------------------------------------------------------------------
-# Import the module under test
-# ---------------------------------------------------------------------------
-
-_install_stubs()
 
 try:
-    pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    if pkg_root not in sys.path:
-        sys.path.insert(0, pkg_root)
-
     _mod = importlib.import_module('jetank_web_control.web_control_node')
     _safe_capture_name = _mod._safe_capture_name
     _yolo_parse = _mod._yolo_parse
