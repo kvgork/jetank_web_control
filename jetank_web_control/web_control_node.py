@@ -2010,6 +2010,9 @@ class WebControlNode(Node):
 
         self._frame_lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
+        # Increments on every new frame so the MJPEG loop can skip re-sending
+        # the identical cached JPEG when the camera runs below the stream rate.
+        self._frame_seq = 0
 
         # Image capture (persistent, for detection-model training datasets).
         self._capture_dir = os.path.expanduser(
@@ -2166,6 +2169,7 @@ class WebControlNode(Node):
     def _on_image(self, msg: CompressedImage):
         with self._frame_lock:
             self._latest_jpeg = bytes(msg.data)
+            self._frame_seq += 1
 
     def _on_raw_image(self, msg: Image):
         # Encode a raw sensor_msgs/Image to JPEG (simulation path). Supports the
@@ -2193,6 +2197,7 @@ class WebControlNode(Node):
         img.save(buf, format='JPEG', quality=80)
         with self._frame_lock:
             self._latest_jpeg = buf.getvalue()
+            self._frame_seq += 1
 
     def _on_map(self, msg: OccupancyGrid):
         if not _PIL_AVAILABLE:
@@ -2231,6 +2236,11 @@ class WebControlNode(Node):
     def get_frame(self) -> Optional[bytes]:
         with self._frame_lock:
             return self._latest_jpeg
+
+    def get_frame_and_seq(self) -> tuple:
+        """Return ``(jpeg_or_None, seq)``; ``seq`` changes only on new frames."""
+        with self._frame_lock:
+            return self._latest_jpeg, self._frame_seq
 
     def save_capture(self):
         """Persist the current full-res frame as a JPEG in capture_dir.
@@ -3004,16 +3014,24 @@ async def handle_mjpeg(request: web.Request) -> web.StreamResponse:
     })
     await response.prepare(request)
 
+    # Only send when a NEW frame has arrived: when the camera publishes below
+    # the ~30 Hz poll rate (or stalls) the loop would otherwise re-transmit the
+    # identical cached JPEG to every client, wasting CPU and WiFi bandwidth.
+    last_seq = None
     try:
         while True:
-            frame = node.get_frame()
-            if frame is not None:
-                header = (
+            frame, seq = node.get_frame_and_seq()
+            if frame is not None and seq != last_seq:
+                last_seq = seq
+                # Separate writes avoid a header+frame bytes concat (a full
+                # frame copy) per part.
+                await response.write(
                     boundary + b'\r\n'
                     b'Content-Type: image/jpeg\r\n'
                     b'Content-Length: ' + str(len(frame)).encode() + b'\r\n\r\n'
                 )
-                await response.write(header + frame + b'\r\n')
+                await response.write(frame)
+                await response.write(b'\r\n')
             await asyncio.sleep(0.033)  # ~30 fps cap
     except (ConnectionResetError, asyncio.CancelledError):
         pass
