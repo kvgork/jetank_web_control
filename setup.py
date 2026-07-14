@@ -12,6 +12,9 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'), glob('launch/*.launch.py')),
+        # Web control page assets, resolved at runtime via ament_index
+        # (resolve_static_dir in web_control_node.py).
+        (os.path.join('share', package_name, 'static'), glob('static/*')),
     ],
     install_requires=['setuptools'],
     # Declares pytest as a test dependency via extras_require (NOT the legacy

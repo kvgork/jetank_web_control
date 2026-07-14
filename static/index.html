@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>JeTank Controller</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>&#x1F916; JeTank</h1>
+  <nav class="tabs">
+    <button class="tab active" id="tab-drive" onclick="showTab('drive')">Drive</button>
+    <button class="tab" id="tab-annot" onclick="showTab('annotate')">&#x1F3F7; Annotate</button>
+  </nav>
+  <span id="ws-label" class="badge dot-err">&#x25CF; Disconnected</span>
+  <span id="cam-label" class="badge" style="color:#8b949e">&#x25CF; Camera</span>
+  <span id="ctrl-mode"></span>
+</header>
+
+<main>
+  <!-- left column: camera on top, live map underneath -->
+  <div class="cam-col">
+  <!-- camera -->
+  <div class="cam">
+    <img id="cam-img" src="/stream.mjpg" alt="camera"
+         onerror="scheduleReconnectStream()" onload="onImgLoad()">
+    <canvas id="det-overlay" class="cam-det"></canvas>
+    <div class="cam-overlay">left camera</div>
+  </div>
+
+  <!-- capture bar: save the current frame to the robot for dataset building -->
+  <div class="capture-bar">
+    <button class="mbtn" id="capture-btn" onclick="capture()">&#x1F4F7; Capture</button>
+    <button class="mbtn" id="label-btn" onclick="openLabeler()">&#x1F3F7; Label</button>
+    <button class="mbtn" id="det-btn" onclick="toggleDetections()">&#x1F441; Detections</button>
+    <span class="capture-sts" id="capture-sts">0 saved</span>
+    <span class="capture-sts" id="det-sts"></span>
+  </div>
+
+  <!-- mapping panel: desktop only, shown when mapping mode is active -->
+  <div class="map-panel" id="map-panel">
+    <div class="map-header">
+      <span class="map-title">&#x1F5FA; Live Map</span>
+      <span class="map-meta-txt" id="map-meta-txt">Waiting for /map topic&#x2026;</span>
+    </div>
+    <div class="map-canvas-wrap">
+      <img id="map-img" src="" alt="" style="cursor:crosshair"
+           onclick="mapClick(event)"
+           onload="this.classList.add('loaded')"
+           onerror="this.classList.remove('loaded');document.getElementById('map-meta-txt').textContent='Waiting for /map topic&#x2026;'">
+      <canvas id="map-overlay"></canvas>
+      <div id="map-loading">
+        <div class="spinner"></div>
+        <div id="map-loading-txt">Determining robot position&#x2026;</div>
+      </div>
+    </div>
+    <div class="map-footer">
+      <span class="map-mode-label">Click&nbsp;mode:</span>
+      <button class="mbtn map-mode mbtn-on" id="mode-navigate" onclick="setMapMode('navigate')">Navigate</button>
+      <button class="mbtn map-mode" id="mode-fetch" onclick="setMapMode('fetch')">&#x1F3AF; Fetch sock</button>
+      <button class="mbtn map-mode" id="mode-deposit" onclick="setMapMode('deposit')">&#x1F4E5; Set deposit area</button>
+      <button class="mbtn" id="cancel-mission-btn" onclick="cancelMission()">&#x2715; Cancel mission</button>
+      <button class="mbtn" id="start-map-btn" onclick="startMapping()">Start Mapping</button>
+      <button class="mbtn" id="start-nav-btn" onclick="startNavigation()" disabled>Navigate (saved map)</button>
+      <button class="mbtn" id="save-map-btn" onclick="saveMap()">Save Map</button>
+      <button class="mbtn" id="stop-nav-btn" onclick="stopNav()">Stop</button>
+      <span class="map-save-sts" id="map-save-sts"></span>
+      <span class="map-save-sts" id="mission-sts"></span>
+      <div class="map-hint" id="nav-hint">Start mapping and drive with the joystick to build a map, or load a saved map and Navigate.</div>
+    </div>
+  </div>
+  </div><!-- /cam-col -->
+
+  <!-- desktop sidebar -->
+  <div class="sidebar">
+    <div class="section">
+      <div class="stitle">Velocity</div>
+      <div class="vel-row"><span>Linear X</span><span id="lv-d">0.00 m/s</span></div>
+      <div class="bar-track"><div id="lbar-d" class="bar-fill bar-fwd" style="width:0%"></div></div>
+      <div class="vel-row" style="margin-top:6px"><span>Angular Z</span><span id="av-d">0.00 rad/s</span></div>
+      <div class="bar-track"><div id="abar-d" class="bar-fill bar-cw" style="width:0%"></div></div>
+    </div>
+    <div class="section">
+      <div class="stitle">Speed Scale</div>
+      <div class="slider-row"><span>Scale</span><span id="spd-label-d">50 %</span></div>
+      <input type="range" id="spd-d" min="5" max="100" value="50">
+    </div>
+    <div class="section">
+      <div class="stitle">D-Pad</div>
+      <div class="dpad">
+        <div class="empty"></div>
+        <button onpointerdown="hold(1,0)"  onpointerup="release()" onpointercancel="release()">&#x25B2;</button>
+        <div class="empty"></div>
+        <button onpointerdown="hold(0,1)"  onpointerup="release()" onpointercancel="release()">&#x25C4;</button>
+        <button onpointerdown="release()"  onpointerup="release()">&#x25FC;</button>
+        <button onpointerdown="hold(0,-1)" onpointerup="release()" onpointercancel="release()">&#x25BA;</button>
+        <div class="empty"></div>
+        <button onpointerdown="hold(-1,0)" onpointerup="release()" onpointercancel="release()">&#x25BC;</button>
+        <div class="empty"></div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="stitle">Keyboard</div>
+      <div class="key-help">
+        <kbd>W</kbd>/<kbd>&#x2191;</kbd> Forward &nbsp;
+        <kbd>S</kbd>/<kbd>&#x2193;</kbd> Back<br>
+        <kbd>A</kbd>/<kbd>&#x2190;</kbd> Left &nbsp;&nbsp;&nbsp;
+        <kbd>D</kbd>/<kbd>&#x2192;</kbd> Right<br>
+        <kbd>Space</kbd> Stop
+      </div>
+    </div>
+    <div class="section">
+      <div class="stitle">Gamepad</div>
+      <div class="gp-row" id="gp-status-d">Not detected</div>
+    </div>
+    <div class="section sidebar-footer">
+      <div class="stitle">Navigation</div>
+      <button class="mbtn" id="map-toggle-btn" onclick="toggleMappingMode()">
+        &#x1F5FA; Mapping Mode
+      </button>
+    </div>
+    <div class="section">
+      <div class="stitle">Arm</div>
+      <button class="mbtn" id="grab-btn-d" onclick="grab()">&#x1F9B2; Grab</button>
+      <div class="grab-sts" id="grab-sts-d"></div>
+    </div>
+  </div>
+
+  <!-- phone panel -->
+  <div class="phone-panel">
+    <div class="vel-chips">
+      <div class="vel-chip">Lin: <span id="lv-p">0.00</span> m/s</div>
+      <div class="vel-chip">Ang: <span id="av-p">0.00</span> rad/s</div>
+    </div>
+    <div class="phone-speed">
+      <label>Speed</label>
+      <input type="range" id="spd-p" min="5" max="100" value="50">
+      <span id="spd-label-p">50 %</span>
+    </div>
+    <button class="mbtn" id="grab-btn-p" onclick="grab()" style="width:100%;max-width:360px">&#x1F9B2; Grab</button>
+    <div class="grab-sts" id="grab-sts-p" style="text-align:center"></div>
+    <div class="joystick-wrap">
+      <div id="joystick">
+        <span class="jlabel top">&#x25B2;</span>
+        <span class="jlabel bot">&#x25BC;</span>
+        <span class="jlabel lft">&#x25C4;</span>
+        <span class="jlabel rgt">&#x25BA;</span>
+        <div id="joystick-thumb"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- label panel (desktop only, toggled by openLabeler()) -->
+<div class="label-panel" id="label-panel">
+  <div class="lbl-header">
+    <span class="lbl-title">&#x1F3F7; Label captures</span>
+    <button class="mbtn" onclick="closeLabeler()">&#x2715; Close</button>
+  </div>
+  <div class="lbl-body">
+    <div class="lbl-list" id="lbl-list"></div>
+    <div class="lbl-canvas-wrap">
+      <img id="lbl-img" src="" alt="">
+      <canvas id="lbl-overlay"></canvas>
+    </div>
+  </div>
+  <div class="lbl-footer">
+    <select id="lbl-class"></select>
+    <input type="text" id="lbl-newclass" placeholder="new class">
+    <button class="mbtn" onclick="lblAddClass()">+</button>
+    <button class="mbtn" onclick="lblSaveLabels()">Save</button>
+    <button class="mbtn" onclick="lblDeleteBox()">Delete box</button>
+    <button class="mbtn" onclick="lblAutoDetect()">&#x2728; Auto-detect</button>
+    <label class="lbl-auto-lbl"><input type="checkbox" id="lbl-auto"> Auto (rough)</label>
+    <span id="lbl-sts"></span>
+    <div class="lbl-hint">Drag on the image to draw a box; click a box to select it.
+      &#x2728; Auto proposes rough boxes (review &amp; save); the toggle auto-runs on unlabelled images.<br>
+      Keys: <b>Enter</b> save+next &middot; <b>E/]</b> next &middot; <b>Q/[</b> prev &middot;
+      <b>R</b> auto-detect &middot; <b>X/Del</b> delete box &middot; <b>Esc</b> deselect &middot; <b>1-9,0</b> class</div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
