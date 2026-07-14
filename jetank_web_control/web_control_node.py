@@ -1466,6 +1466,12 @@ async def handle_map_meta(request: web.Request) -> web.Response:
 # proc.wait, pkill + time.sleep, wait_for_server) — run them in a worker
 # thread via asyncio.to_thread so the single asyncio loop keeps servicing
 # /ws teleop and /stream.mjpg while a nav stack starts/stops.
+#
+# Moving them off the loop also removed the loop's implicit serialization:
+# two concurrent POSTs to /nav lifecycle endpoints could interleave (the
+# second request's pkill killing the first's half-started stack, and the
+# Popen handle being overwritten). app['nav_lock'] is therefore held across
+# each FULL stop→pkill→sleep→Popen sequence to restore that guarantee.
 
 async def handle_save_map(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
@@ -1477,21 +1483,24 @@ async def handle_save_map(request: web.Request) -> web.Response:
 
 async def handle_start_mapping(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    ok, msg = await asyncio.to_thread(node.start_mapping)
+    async with request.app['nav_lock']:
+        ok, msg = await asyncio.to_thread(node.start_mapping)
     return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
                              status=200 if ok else 400)
 
 
 async def handle_start_navigation(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    ok, msg = await asyncio.to_thread(node.start_navigation)
+    async with request.app['nav_lock']:
+        ok, msg = await asyncio.to_thread(node.start_navigation)
     return web.json_response({'status': 'ok' if ok else 'error', 'msg': msg},
                              status=200 if ok else 400)
 
 
 async def handle_stop_nav(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    mode = await asyncio.to_thread(node.stop_nav)
+    async with request.app['nav_lock']:
+        mode = await asyncio.to_thread(node.stop_nav)
     return web.json_response({'status': 'ok', 'stopped': mode})
 
 
@@ -1509,9 +1518,11 @@ async def handle_navigate(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
     try:
         data = await request.json()
-        # navigate_to_pixel may block up to 2 s in wait_for_server().
-        ok, info = await asyncio.to_thread(
-            node.navigate_to_pixel, int(data['x']), int(data['y']))
+        # navigate_to_pixel may block up to 2 s in wait_for_server(); hold the
+        # nav lock so it never races a concurrent nav start/stop sequence.
+        async with request.app['nav_lock']:
+            ok, info = await asyncio.to_thread(
+                node.navigate_to_pixel, int(data['x']), int(data['y']))
     except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
         return web.json_response({'status': 'error', 'msg': f'bad request: {exc}'}, status=400)
     if ok:
@@ -1673,6 +1684,9 @@ def build_app(node: WebControlNode) -> web.Application:
     static_dir = resolve_static_dir()
     with open(os.path.join(static_dir, 'index.html'), encoding='utf-8') as fh:
         app['index_html'] = fh.read()
+    # Serializes the blocking nav-lifecycle sequences (see comment above the
+    # nav handlers) now that asyncio.to_thread runs them off the event loop.
+    app['nav_lock'] = asyncio.Lock()
     app.router.add_get('/', handle_index)
     app.router.add_static('/static', static_dir)
     app.router.add_get('/stream.mjpg', handle_mjpeg)
