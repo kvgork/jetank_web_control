@@ -1688,7 +1688,9 @@ def build_app(node: WebControlNode) -> web.Application:
     # nav handlers) now that asyncio.to_thread runs them off the event loop.
     app['nav_lock'] = asyncio.Lock()
     app.router.add_get('/', handle_index)
-    app.router.add_static('/static', static_dir)
+    # follow_symlinks: colcon --symlink-install makes every installed asset a
+    # symlink; aiohttp's default (False) would 404 all of them from install space.
+    app.router.add_static('/static', static_dir, follow_symlinks=True)
     app.router.add_get('/stream.mjpg', handle_mjpeg)
     app.router.add_get('/ws', handle_websocket)
     app.router.add_get('/detections/latest', handle_detections)
