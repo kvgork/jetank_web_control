@@ -369,7 +369,6 @@ ros2 launch jetank_web_control web_control.launch.py \
 |-------|------|------|
 | `/cmd_vel` (param `cmd_vel_topic`; remapped to `/cmd_vel_teleop` when `sim:=true`) | `geometry_msgs/Twist` | `web_control_node` |
 | `/initialpose` | `geometry_msgs/PoseWithCovarianceStamped` | `web_control_node` (tight AMCL seed covariance) |
-| `/mission/goal` | `geometry_msgs/PoseStamped` | `web_control_node` (debug echo of the Fetch goal point) |
 | `/diff_drive_controller/cmd_vel` (param `output_topic`) | `geometry_msgs/TwistStamped` | `cmd_vel_bridge` |
 
 ### Subscribed topics
