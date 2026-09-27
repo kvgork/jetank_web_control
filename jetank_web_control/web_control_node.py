@@ -569,6 +569,11 @@ class WebControlNode(Node):
                 img = _PILImage.fromarray(arr, 'RGB')
             elif enc in ('mono8', '8uc1'):
                 img = _PILImage.fromarray(arr.reshape((h, w)), 'L')
+            elif enc in ('rgba8', 'bgra8'):
+                arr = arr.reshape((h, w, 4))[:, :, :3]
+                if enc == 'bgra8':
+                    arr = arr[:, :, ::-1]
+                img = _PILImage.fromarray(np.ascontiguousarray(arr), 'RGB')
             else:  # best-effort: assume 3-channel
                 img = _PILImage.fromarray(arr.reshape((h, w, 3)), 'RGB')
         except ValueError:
