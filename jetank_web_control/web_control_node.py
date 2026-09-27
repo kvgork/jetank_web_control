@@ -586,12 +586,12 @@ class WebControlNode(Node):
         if w == 0 or h == 0:
             return
         data = np.frombuffer(msg.data, dtype=np.int8).reshape((h, w))
-        rgb = np.full((h, w, 3), 128, dtype=np.uint8)   # unknown = mid-gray
-        rgb[data == 0] = [220, 220, 220]                 # free = light
-        rgb[data > 0] = [20, 20, 20]                      # occupied = dark
-        img = _PILImage.fromarray(np.flipud(rgb), 'RGB')
+        gray = np.full((h, w), 128, dtype=np.uint8)      # unknown = mid-gray
+        gray[data == 0] = 220                             # free = light
+        gray[data > 0] = 20                                # occupied = dark
+        img = _PILImage.fromarray(np.flipud(gray), 'L')
         buf = io.BytesIO()
-        img.save(buf, format='PNG', optimize=True)
+        img.save(buf, format='PNG', optimize=False, compress_level=1)
         ox = float(msg.info.origin.position.x)
         oy = float(msg.info.origin.position.y)
         with self._map_lock:
