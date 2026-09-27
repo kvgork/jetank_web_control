@@ -646,19 +646,34 @@ class WebControlNode(Node):
                     self._image_msg_type, self._image_topic, self._image_cb, 10)
 
     def _remove_stream_viewer(self) -> None:
-        """Unsubscribe on the 1->0 viewer transition."""
+        """Unsubscribe on the 1->0 viewer transition.
+
+        Also drops the cached frame: otherwise the next 0->1 viewer (a
+        fresh MJPEG client, or a /capture that borrows the subscription)
+        would see the stale frame from the previous session before the
+        new subscription delivers anything.
+        """
         with self._image_sub_lock:
             self._image_viewers = max(0, self._image_viewers - 1)
             if self._image_viewers == 0 and self._image_sub is not None:
                 sub = self._image_sub
                 self._image_sub = None
                 self.destroy_subscription(sub)
+                with self._frame_lock:
+                    self._latest_jpeg = None
 
     async def save_capture_async(self, timeout: float = 1.0):
         """Like ``save_capture()``, but subscribes briefly first if no
         stream client is already open, so a capture works even with 0
         MJPEG viewers connected (the camera subscription is otherwise
         gated off in that case). Awaits without blocking the event loop.
+
+        When borrowing the subscription, waits for a genuinely fresh
+        frame (a new seq, which only ever accompanies a non-None frame)
+        rather than falling back to whatever stale frame happened to be
+        cached from a previous viewer session. If the deadline passes
+        with no fresh frame, returns an explicit error instead of saving
+        the stale one.
         """
         borrowed = False
         with self._image_sub_lock:
@@ -668,15 +683,19 @@ class WebControlNode(Node):
                 if self._image_sub is None:
                     self._image_sub = self.create_subscription(
                         self._image_msg_type, self._image_topic, self._image_cb, 10)
-        if borrowed:
-            _, seq_before = self.get_frame_and_seq()
-            deadline = time.monotonic() + timeout
-            while time.monotonic() < deadline:
-                _, seq_now = self.get_frame_and_seq()
-                if seq_now != seq_before:
-                    break
-                await asyncio.sleep(0.02)
         try:
+            if borrowed:
+                _, seq_before = self.get_frame_and_seq()
+                deadline = time.monotonic() + timeout
+                got_fresh = False
+                while time.monotonic() < deadline:
+                    frame_now, seq_now = self.get_frame_and_seq()
+                    if frame_now is not None and seq_now != seq_before:
+                        got_fresh = True
+                        break
+                    await asyncio.sleep(0.02)
+                if not got_fresh:
+                    return False, 'no camera frame received before capture timeout'
             return self.save_capture()
         finally:
             if borrowed:
