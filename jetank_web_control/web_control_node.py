@@ -489,10 +489,17 @@ class WebControlNode(Node):
                 'jetank_manipulation not found — Grab button will be disabled')
 
         self._cmd_vel_pub = self.create_publisher(Twist, cmd_topic, 10)
-        if image_compressed:
-            self.create_subscription(CompressedImage, image_topic, self._on_image, 10)
-        else:
-            self.create_subscription(Image, image_topic, self._on_raw_image, 10)
+        # Camera subscription is created lazily, gated by the number of
+        # active stream viewers (see _add_stream_viewer / _remove_stream_
+        # viewer). With 0 browser viewers the always-on subscription used to
+        # deserialize ~30 fps of frames purely to discard them, burning
+        # ~5-6% of an Orin Nano core 24/7 in the common (no-viewer) case.
+        self._image_msg_type = CompressedImage if image_compressed else Image
+        self._image_cb = self._on_image if image_compressed else self._on_raw_image
+        self._image_topic = image_topic
+        self._image_sub_lock = threading.Lock()
+        self._image_sub = None
+        self._image_viewers = 0
         self.create_subscription(OccupancyGrid, '/map', self._on_map, 1)
         detections_topic = self.get_parameter('detections_topic').value
         self.create_subscription(Detection2DArray, detections_topic,
@@ -562,6 +569,11 @@ class WebControlNode(Node):
                 img = _PILImage.fromarray(arr, 'RGB')
             elif enc in ('mono8', '8uc1'):
                 img = _PILImage.fromarray(arr.reshape((h, w)), 'L')
+            elif enc in ('rgba8', 'bgra8'):
+                arr = arr.reshape((h, w, 4))[:, :, :3]
+                if enc == 'bgra8':
+                    arr = arr[:, :, ::-1]
+                img = _PILImage.fromarray(np.ascontiguousarray(arr), 'RGB')
             else:  # best-effort: assume 3-channel
                 img = _PILImage.fromarray(arr.reshape((h, w, 3)), 'RGB')
         except ValueError:
@@ -579,12 +591,12 @@ class WebControlNode(Node):
         if w == 0 or h == 0:
             return
         data = np.frombuffer(msg.data, dtype=np.int8).reshape((h, w))
-        rgb = np.full((h, w, 3), 128, dtype=np.uint8)   # unknown = mid-gray
-        rgb[data == 0] = [220, 220, 220]                 # free = light
-        rgb[data > 0] = [20, 20, 20]                      # occupied = dark
-        img = _PILImage.fromarray(np.flipud(rgb), 'RGB')
+        gray = np.full((h, w), 128, dtype=np.uint8)      # unknown = mid-gray
+        gray[data == 0] = 220                             # free = light
+        gray[data > 0] = 20                                # occupied = dark
+        img = _PILImage.fromarray(np.flipud(gray), 'L')
         buf = io.BytesIO()
-        img.save(buf, format='PNG', optimize=True)
+        img.save(buf, format='PNG', optimize=False, compress_level=1)
         ox = float(msg.info.origin.position.x)
         oy = float(msg.info.origin.position.y)
         with self._map_lock:
@@ -620,6 +632,79 @@ class WebControlNode(Node):
         """Return ``(jpeg_or_None, seq)``; ``seq`` changes only on new frames."""
         with self._frame_lock:
             return self._latest_jpeg, self._frame_seq
+
+    # ---- lazy camera subscription (stream-client refcount) ---------------
+    #
+    # The CompressedImage/Image subscription is only alive while at least one
+    # consumer (an MJPEG stream client, or a one-shot /capture) needs it.
+    # create_subscription()/destroy_subscription() are safe to call from this
+    # (aiohttp) thread while rclpy.spin() runs on the background ROS thread:
+    # they mutate the node's own subscription list and wake the executor's
+    # wait set via its guard condition rather than touching it directly.
+
+    def _add_stream_viewer(self) -> None:
+        """Subscribe to the camera topic on the 0->1 viewer transition."""
+        with self._image_sub_lock:
+            self._image_viewers += 1
+            if self._image_sub is None:
+                self._image_sub = self.create_subscription(
+                    self._image_msg_type, self._image_topic, self._image_cb, 10)
+
+    def _remove_stream_viewer(self) -> None:
+        """Unsubscribe on the 1->0 viewer transition.
+
+        Also drops the cached frame: otherwise the next 0->1 viewer (a
+        fresh MJPEG client, or a /capture that borrows the subscription)
+        would see the stale frame from the previous session before the
+        new subscription delivers anything.
+        """
+        with self._image_sub_lock:
+            self._image_viewers = max(0, self._image_viewers - 1)
+            if self._image_viewers == 0 and self._image_sub is not None:
+                sub = self._image_sub
+                self._image_sub = None
+                self.destroy_subscription(sub)
+                with self._frame_lock:
+                    self._latest_jpeg = None
+
+    async def save_capture_async(self, timeout: float = 1.0):
+        """Like ``save_capture()``, but subscribes briefly first if no
+        stream client is already open, so a capture works even with 0
+        MJPEG viewers connected (the camera subscription is otherwise
+        gated off in that case). Awaits without blocking the event loop.
+
+        When borrowing the subscription, waits for a genuinely fresh
+        frame (a new seq, which only ever accompanies a non-None frame)
+        rather than falling back to whatever stale frame happened to be
+        cached from a previous viewer session. If the deadline passes
+        with no fresh frame, returns an explicit error instead of saving
+        the stale one.
+        """
+        borrowed = False
+        with self._image_sub_lock:
+            if self._image_viewers == 0:
+                borrowed = True
+                self._image_viewers += 1
+                if self._image_sub is None:
+                    self._image_sub = self.create_subscription(
+                        self._image_msg_type, self._image_topic, self._image_cb, 10)
+        try:
+            if borrowed:
+                _, seq_before = self.get_frame_and_seq()
+                deadline = time.monotonic() + timeout
+                got_fresh = False
+                while time.monotonic() < deadline:
+                    frame_now, seq_now = self.get_frame_and_seq()
+                    if frame_now is not None and seq_now != seq_before:
+                        got_fresh = True
+                        break
+                    await asyncio.sleep(0.02)
+                if not got_fresh:
+                    return False, 'no camera frame received before capture timeout'
+            return self.save_capture()
+        finally:
+            if borrowed:
+                self._remove_stream_viewer()
 
     def save_capture(self):
         """Persist the current full-res frame as a JPEG in capture_dir.
@@ -1391,6 +1476,12 @@ async def handle_mjpeg(request: web.Request) -> web.StreamResponse:
     })
     await response.prepare(request)
 
+    # Subscribe to the camera topic only while >=1 stream client is
+    # connected (0->1 viewer transition); unsubscribe again in `finally`
+    # so the node stops deserializing frames the moment the last viewer
+    # disconnects, rather than running the subscription 24/7.
+    node._add_stream_viewer()
+
     # Only send when a NEW frame has arrived: when the camera publishes below
     # the ~30 Hz poll rate (or stalls) the loop would otherwise re-transmit the
     # identical cached JPEG to every client, wasting CPU and WiFi bandwidth.
@@ -1412,6 +1503,8 @@ async def handle_mjpeg(request: web.Request) -> web.StreamResponse:
             await asyncio.sleep(0.033)  # ~30 fps cap
     except (ConnectionResetError, asyncio.CancelledError):
         pass
+    finally:
+        node._remove_stream_viewer()
 
     return response
 
@@ -1578,7 +1671,11 @@ async def handle_get_deposit(request: web.Request) -> web.Response:
 
 async def handle_capture(request: web.Request) -> web.Response:
     node: WebControlNode = request.app['node']
-    ok, info = node.save_capture()
+    # Same viewer-gated subscription as the MJPEG stream: save_capture_async
+    # subscribes briefly on its own when no stream client is already open,
+    # so a capture still works even though the camera topic is otherwise
+    # not subscribed with 0 viewers connected.
+    ok, info = await node.save_capture_async()
     if ok:
         return web.json_response({'ok': True, **info})
     return web.json_response({'ok': False, 'error': info}, status=503)

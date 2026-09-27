@@ -5,6 +5,7 @@ let ws = null;
 let linearX = 0, angularZ = 0;
 let speedScale = 0.5;
 let sendTimer = null, reconnectTimer = null;
+let lastSentWasZero = false;
 const keysDown = new Set();
 let isTouch = false;
 
@@ -189,6 +190,7 @@ function connect() {
   ws.onopen = () => {
     wsLabel.className = 'badge dot-ok';
     wsLabel.textContent = '\u25CF Connected';
+    lastSentWasZero = false;
     startLoop();
   };
   ws.onclose = () => {
@@ -207,8 +209,10 @@ function tick() {
   }
   const l = linearX  * speedScale;
   const a = angularZ * speedScale;
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  const isZero = l === 0 && a === 0;
+  if (ws && ws.readyState === WebSocket.OPEN && !(isZero && lastSentWasZero)) {
     ws.send(JSON.stringify({linear_x: l, angular_z: a}));
+    lastSentWasZero = isZero;
   }
   updateUI(l, a);
 }
